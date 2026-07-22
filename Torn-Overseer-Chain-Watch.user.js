@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.19.0
+// @version      0.20.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -654,6 +654,11 @@
     const cfg = settings();
     if (!cfg.tornKey) throw new Error("Add your Torn API key first.");
     if (!cfg.functionsUrl || !cfg.anonKey) throw new Error("The script backend is not configured.");
+    // persist:false — identity-only. The site validates the key against Torn to confirm
+    // who we are + our faction, but stores NO copy of the key (the key lives only here, in
+    // GM storage, for the zero-lag direct-to-Torn calls). The session it mints lasts ~12h;
+    // when it lapses, callFunction's 401 path re-mints from the stored key, re-checking the
+    // faction at Torn each time.
     const res = await requestJson(`${cfg.functionsUrl.replace(/\/+$/, "")}/connect-torn-key`, {
       method: "POST",
       headers: {
@@ -661,7 +666,7 @@
         apikey: cfg.anonKey,
         Authorization: `Bearer ${cfg.anonKey}`,
       },
-      body: { apiKey: cfg.tornKey },
+      body: { apiKey: cfg.tornKey, persist: false },
     });
     if (!res || typeof res.sessionToken !== "string") {
       throw new Error("The site did not return a session token.");
