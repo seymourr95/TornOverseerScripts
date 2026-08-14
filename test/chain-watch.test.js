@@ -42,24 +42,55 @@ test("parseChain is inactive with no chain running", () => {
   assert.equal(cw.parseChain({ chain: { current: 0, timeout: 0 } }, null).active, false);
 });
 
-test("parseChain uses chain.end when it agrees with timeout", () => {
+test("parseChain does NOT trust chain.end until it is seen to track a hit", () => {
+  // The arithmetic check alone is circular: the clock offset is derived from
+  // (end - timeout), so validating (end - timeout) against it returns zero by
+  // construction and would accept a long-stale `end` on the very first poll.
+  cw.resetClockSamplesForTests();
   const end = nowSec() + 240;
-  const c = cw.parseChain({ chain: { current: 50, timeout: 240, end } }, null);
-  assert.equal(c.timeSource, "chain.end");
-  assert.ok(c.deadlineLocalMs != null);
-  assert.ok(Math.abs(c.timeout - 240) <= 1, `expected ~240, got ${c.timeout}`);
+  const c = cw.parseChain({ chain: { id: 1, current: 50, timeout: 240, end } }, null);
+  assert.notEqual(c.timeSource, "chain.end", "one reading proves nothing about end");
+  assert.equal(c.deadlineLocalMs, null);
+  assert.ok(Math.abs(c.timeout - 240) <= 1, "the anchored countdown is still correct");
 });
 
-test("parseChain rejects an end that does not line up with timeout", () => {
-  // end says the chain started 30m ago and lasts 5m — inconsistent with timeout=240.
-  const c = cw.parseChain({ chain: { current: 50, timeout: 240, end: nowSec() - 1800 + 300 } }, null);
-  assert.notEqual(c.timeSource, "chain.end");
-  assert.equal(c.deadlineLocalMs, null);
+test("chain.end is adopted once a landed hit moves it", () => {
+  cw.resetClockSamplesForTests();
+  const t = nowSec();
+  // Two reads of the same chain with a hit between them, and `end` pushed out with it.
+  cw.parseChain({ chain: { id: 9, current: 50, timeout: 240, end: t + 240 } }, null);
+  const after = cw.parseChain({ chain: { id: 9, current: 51, timeout: 300, end: t + 300 } }, null);
+  assert.equal(after.endTracks, true);
+  assert.equal(after.timeSource, "chain.end");
+  assert.ok(after.deadlineLocalMs != null);
+});
+
+test("a static chain.end is rejected even though the arithmetic looks perfect", () => {
+  // This is the case the old check waved through: end fixed at chainStart+300 while the
+  // chain runs on. (end - timeout) still lands exactly on "now" by construction.
+  cw.resetClockSamplesForTests();
+  const t = nowSec();
+  const staticEnd = t - 1500; // chain started 30 min ago; end never moved
+  cw.parseChain({ chain: { id: 11, current: 50, timeout: 240, end: staticEnd } }, null);
+  const after = cw.parseChain({ chain: { id: 11, current: 51, timeout: 300, end: staticEnd } }, null);
+  assert.equal(after.endTracks, false, "a hit landed and end did not move");
+  assert.notEqual(after.timeSource, "chain.end");
+  assert.equal(after.deadlineLocalMs, null, "must not count down to a stale instant");
+});
+
+test("end behaviour is never inferred across two different chains", () => {
+  // A new chain moves current and end together, which would look like tracking.
+  cw.resetClockSamplesForTests();
+  const t = nowSec();
+  cw.parseChain({ chain: { id: 1, current: 400, timeout: 200, end: t + 200 } }, null);
+  const newChain = cw.parseChain({ chain: { id: 2, current: 3, timeout: 280, end: t + 280 } }, null);
+  assert.equal(newChain.endTracks, null, "a different chain id proves nothing");
 });
 
 test("parseChain rejects end=0 and the 2^30 schema placeholder", () => {
+  cw.resetClockSamplesForTests();
   for (const end of [0, 1073741824]) {
-    const c = cw.parseChain({ chain: { current: 50, timeout: 240, end } }, null);
+    const c = cw.parseChain({ chain: { id: 1, current: 50, timeout: 240, end } }, null);
     assert.notEqual(c.timeSource, "chain.end", `end=${end} should not be trusted`);
   }
 });

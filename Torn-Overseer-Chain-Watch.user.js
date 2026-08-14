@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.25.1
+// @version      0.25.2
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -40,7 +40,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.25.1";
+      : "") || "0.25.2";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -683,6 +683,46 @@
   // skew has to start from empty. Unused by the userscript itself.
   function resetClockSamplesForTests() {
     clockOffsets.length = 0;
+    endTracks = null;
+    lastSeenCurrent = null;
+    lastSeenEnd = null;
+    endWatchChainId = null;
+  }
+
+  // --- Is `end` the live drop deadline, or just chainStart + 300? -----------------------
+  // A live sample looked conclusive: current 1, start …543, end …843, timeout 33, and
+  // 267 elapsed + 33 remaining = exactly 300. But with ONE hit the last hit IS the chain
+  // start, so `end = start + 300` and `end = lastHit + 300` are the same number — the
+  // sample cannot separate them.
+  //
+  // Nor can arithmetic, and this is the trap: the clock offset is itself derived from
+  // (end − timeout), so checking (end − timeout) against it is circular and returns zero
+  // by construction. It would have accepted a half-hour-stale `end` on the first poll.
+  //
+  // The only honest test is behavioural. When a hit lands, `current` rises. If `end` moves
+  // with it, `end` tracks the last hit and IS the deadline. Until that is actually
+  // observed, the anchored countdown is used — which is exact anyway while the endpoint
+  // answers live, so waiting for evidence costs nothing.
+  let endTracks = null; // null = not yet observed, true/false = observed
+  let lastSeenCurrent = null;
+  let lastSeenEnd = null;
+  let endWatchChainId = null;
+
+  function noteEndBehaviour(chainId, current, endUnix) {
+    if (!Number.isFinite(current) || !(endUnix > 0)) return;
+    // Never compare across two different chains — a new chain moves both at once.
+    if (chainId !== endWatchChainId) {
+      endWatchChainId = chainId;
+      lastSeenCurrent = current;
+      lastSeenEnd = endUnix;
+      return;
+    }
+    if (lastSeenCurrent != null && current > lastSeenCurrent) {
+      // A hit landed between these two reads: did the deadline move out with it?
+      endTracks = endUnix > lastSeenEnd;
+    }
+    lastSeenCurrent = current;
+    lastSeenEnd = endUnix;
   }
 
   // Running minimum of (local receipt − server Date). That minimum converges to the
@@ -985,15 +1025,19 @@
     // stale `end` from a previous chain, or an `end` meaning something else entirely,
     // won't line up with `timeout` by coincidence.
     const endUnix = num(c.end) ?? 0;
+    const chainId = num(c.id) ?? 0;
     const nowSec = Date.now() / 1000;
+    noteEndBehaviour(chainId, current, endUnix);
     noteServerClock(endUnix, rawTimeout, nowSec);
     const offset = serverClockOffsetSec();
     const genUnix = endUnix > 0 && rawTimeout > 0 ? endUnix - rawTimeout : 0;
     // Age of this response, on a common clock: how far its generation time sits behind
     // now, once the member's skew is taken out. Near zero for an uncached endpoint.
     const genAge = genUnix > 0 && offset != null ? nowSec - offset - genUnix : null;
-    // Allow a little negative slack for jitter, and up to 3 minutes of cache age.
-    const endUsable = genAge != null && genAge >= -5 && genAge <= 180;
+    // `end` is used ONLY once it has been seen to move with a landed hit. The genAge
+    // range stays as a secondary sanity check, but it is not what makes this safe —
+    // noteEndBehaviour is.
+    const endUsable = endTracks === true && genAge != null && genAge >= -5 && genAge <= 180;
     // The drop instant expressed on the MEMBER's clock, so the per-second countdown can
     // just subtract Date.now() forever — no re-anchoring, no drift, nothing to go stale.
     const deadlineLocalMs = endUsable ? (endUnix + offset) * 1000 : null;
@@ -1014,6 +1058,7 @@
       // Which mechanism gave us this countdown, best first — surfaced in the UI so a
       // member (and we) can tell at a glance whether it's exact or merely bounded.
       timeSource: endUsable ? "chain.end" : freshness?.source || "uncorrected",
+      endTracks,
       // How long this response had been cached. Derived from (end − timeout) when that
       // checks out, otherwise measured from the headers. Reported in the UI either way.
       staleSec: endUsable ? Math.max(0, genAge) : stale,
@@ -2251,7 +2296,12 @@
     if (src === "date") {
       return `Corrected to ~1s using the response Date header (was ~${Math.round(stale || 0)}s cached).`;
     }
-    return "Approximate — Torn sent no freshness header, so the countdown is bounded by the poll interval, not exact.";
+    const watching = state.chain?.endTracks === false
+      ? " Torn's chain.end does NOT move when a hit lands, so it is not the drop deadline and is ignored."
+      : state.chain?.endTracks == null
+        ? " Still watching whether Torn's chain.end moves when a hit lands; until it does, this stays anchored."
+        : "";
+    return `Anchored to the last reading and counting down locally — accurate to within the poll interval.${watching}`;
   }
 
   function timerUrgencyClass(remaining) {
@@ -4304,6 +4354,7 @@
         validateSchedule,
         parseTctInput,
         currentAndNextShift,
+        noteEndBehaviour,
         allShifts,
         coversAt,
         render,
