@@ -643,3 +643,59 @@ test("parseAttacks reports how many hits the sample actually covers", () => {
   ] };
   assert.equal(cw.parseAttacks(raw, 111, t - 600, new Set([111, 222])).counted, 2);
 });
+
+// --- The leaderboard window --------------------------------------------------------
+// Reported from a live chain: a warm-up at 2/10 hits (both from one player) showed 5-10
+// faction members each with multiple hits, then corrected itself seconds later. The
+// window was computed from state.chain BEFORE the chain fetch resolved, so on the poll
+// where a chain begins it saw the previous (null) chain and fell back to a rolling 4h.
+
+test("the window follows a running chain, not the clock", () => {
+  const start = nowSec() - 120;
+  assert.equal(
+    cw.leaderboardWindowStart({ active: true, start }), start,
+    "a live chain must window to its own start",
+  );
+});
+
+test("the window falls back to a rolling 4h only when no chain is running", () => {
+  const fourHoursAgo = nowSec() - 4 * 3600;
+  for (const chain of [null, { active: false, start: 0 }, { active: true, start: 0 }]) {
+    const got = cw.leaderboardWindowStart(chain);
+    assert.ok(Math.abs(got - fourHoursAgo) <= 2, `expected ~4h ago for ${JSON.stringify(chain)}`);
+  }
+});
+
+test("a chain that just began windows to itself, not to four hours of history", () => {
+  // The exact reported state: warm-up, 2 hits, chain started seconds ago.
+  const start = nowSec() - 30;
+  const chain = { active: true, current: 2, start };
+  const win = cw.leaderboardWindowStart(chain);
+
+  const raw = { attacks: [
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "A", respect_gain: 4, timestamp_ended: start + 5, chain: 1 },
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "B", respect_gain: 4, timestamp_ended: start + 20, chain: 2 },
+    // Everything below is from BEFORE this chain and must not appear.
+    { attacker_id: 222, attacker_name: "Bob", defender_name: "C", respect_gain: 3, timestamp_ended: start - 600, chain: 40 },
+    { attacker_id: 333, attacker_name: "Carol", defender_name: "D", respect_gain: 3, timestamp_ended: start - 3000, chain: 12 },
+  ] };
+  const out = cw.parseAttacks(raw, 111, win, new Set([111, 222, 333]));
+  assert.deepEqual(out.leaderboard.map((r) => r.name), ["Alice"]);
+  assert.equal(out.leaderboard[0].hits, 2, "must match the chain counter, not the last 4h");
+  assert.equal(out.counted, 2);
+});
+
+test("factionMemberIds prefers our own roster and falls back to the payload's", () => {
+  resetState();
+  cw.state.tornRoster = { 111: { name: "Alice" }, 222: { name: "Bob" } };
+  assert.deepEqual([...cw.factionMemberIds()].sort((a, b) => a - b), [111, 222]);
+
+  resetState();
+  cw.state.tornRoster = null;
+  cw.state.watch = { roster: [{ id: 333, name: "Carol" }] };
+  assert.deepEqual([...cw.factionMemberIds()], [333]);
+
+  resetState();
+  cw.state.tornRoster = null;
+  assert.equal(cw.factionMemberIds().size, 0, "no roster => no filter, rather than a wrong one");
+});

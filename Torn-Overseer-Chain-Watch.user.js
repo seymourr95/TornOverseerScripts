@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.26.0
+// @version      0.26.1
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -40,7 +40,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.26.0";
+      : "") || "0.26.1";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -1244,6 +1244,33 @@
     return Object.keys(out).length ? out : null;
   }
 
+  // Window the leaderboard to the RUNNING chain, so it shows this chain's hitters and not
+  // the last few hours of unrelated attacks. Between chains a rolling 4h is the only
+  // sensible span. Takes the chain explicitly — reading it from state was the bug.
+  function leaderboardWindowStart(chain) {
+    return chain?.active && chain.start > 0
+      ? chain.start
+      : Math.floor(Date.now() / 1000) - 4 * 3600;
+  }
+
+  // Faction member ids, for filtering INCOMING enemy attacks out of the leaderboard. Our
+  // own roster first: the backend payload's is empty for an identity-only session (25s
+  // cache TTL), which made this filter a silent no-op and listed enemies as top hitters.
+  function factionMemberIds() {
+    const ids = new Set(
+      Object.keys(state.tornRoster || {})
+        .map((id) => Number(id))
+        .filter((n) => Number.isFinite(n) && n > 0),
+    );
+    if (!ids.size) {
+      for (const m of state.signup?.roster || state.watch?.roster || []) {
+        const n = Number(m?.id);
+        if (Number.isFinite(n) && n > 0) ids.add(n);
+      }
+    }
+    return ids;
+  }
+
   // Freshness bookkeeping so the heavier reads (attacks, roster, backend schedule) run on
   // their own slower cadence than the fast chain poll.
   let lastAttacksAt = 0;
@@ -1312,6 +1339,7 @@
       let scheduleErr = null;
       let tornChain = null;
       let tornAttacks = null;
+      let attacksRaw = null;
       let tornChainErr = null;
 
       // 1) Backend schedule (event / shifts / roster) + a FALLBACK live block. Throttled
@@ -1356,27 +1384,6 @@
         }
       }
       if (hasKey && isLeader) {
-        // Window the leaderboard to the running chain (its start), else a rolling 4h;
-        // filter to faction members so incoming enemy hits don't pollute it.
-        const chainStart = state.chain?.active && state.chain.start > 0
-          ? state.chain.start
-          : Math.floor(Date.now() / 1000) - 4 * 3600;
-        // Faction members, for filtering INCOMING enemy attacks out of the leaderboard.
-        // This was built from the backend payload's roster — which is empty for an
-        // identity-only session (its cache has a 25s TTL), so rosterIds came back empty,
-        // the filter silently became a no-op, and enemies who hit us appeared as our own
-        // top hitters. Our own roster is the one that's actually populated.
-        const rosterIds = new Set(
-          Object.keys(state.tornRoster || {})
-            .map((id) => Number(id))
-            .filter((n) => Number.isFinite(n) && n > 0),
-        );
-        if (!rosterIds.size) {
-          for (const m of state.signup?.roster || state.watch?.roster || []) {
-            const n = Number(m?.id);
-            if (Number.isFinite(n) && n > 0) rosterIds.add(n);
-          }
-        }
         let chainFreshness = null;
         tasks.push(
           tornFetch("/faction/chain", {
@@ -1400,8 +1407,10 @@
         }
         if (wantAttacks) {
           tasks.push(
+            // Only the RAW response here. Parsing needs the chain's start and the roster,
+            // and both are resolved by requests still in flight — see the parse below.
             tornLegacyFaction("attacks")
-              .then((raw) => { tornAttacks = parseAttacks(raw, viewerId(), chainStart, rosterIds); lastAttacksAt = Date.now(); })
+              .then((raw) => { attacksRaw = raw; lastAttacksAt = Date.now(); })
               .catch(() => { /* no faction API access etc. — fall back to the backend block */ }),
           );
         }
@@ -1447,6 +1456,19 @@
           // letting a frozen hit count keep wearing the LIVE badge.
           state.chainStaleError = tornChainErr || state.chainStaleError;
         }
+      }
+
+      // NOW parse the attacks, because only now do we know which chain we are in.
+      //
+      // This used to happen inside the fetch, using state.chain — LAST poll's chain. On the
+      // poll where a chain begins, that chain was still null, so the window fell back to a
+      // rolling 4 hours and the board filled with every hit of the previous few hours: a
+      // faction of "top hitters" next to a chain counter reading 2. The next poll, with
+      // state.chain now populated, silently corrected it. Same staleness applied to the
+      // roster on a cold start, which let enemies through.
+      if (attacksRaw) {
+        const rosterIds = factionMemberIds();
+        tornAttacks = parseAttacks(attacksRaw, viewerId(), leaderboardWindowStart(state.chain), rosterIds);
       }
 
       // Resolve the leaderboard the same way (direct Torn -> backend -> keep last).
@@ -4389,6 +4411,8 @@
         validateSchedule,
         parseTctInput,
         currentAndNextShift,
+        leaderboardWindowStart,
+        factionMemberIds,
         noteEndBehaviour,
         allShifts,
         coversAt,
