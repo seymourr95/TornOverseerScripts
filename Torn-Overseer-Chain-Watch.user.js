@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.26.1
+// @version      0.26.2
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -40,7 +40,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.26.1";
+      : "") || "0.26.2";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -719,7 +719,17 @@
     }
     if (lastSeenCurrent != null && current > lastSeenCurrent) {
       // A hit landed between these two reads: did the deadline move out with it?
+      const was = endTracks;
       endTracks = endUnix > lastSeenEnd;
+      // A title tooltip needs a mouse, so it is unreachable on PDA and hidden while the
+      // panel is collapsed. Log the answer once per change so it can be read off the
+      // console instead of hunted for in the UI.
+      if (endTracks !== was) {
+        console.info(
+          `[Torn Overseer Chain Watch] chain.end ${endTracks ? "TRACKS the last hit — using it as the drop deadline" : "did NOT move on a hit — ignoring it"}`,
+          { chainId, current, end: endUnix, previousEnd: lastSeenEnd },
+        );
+      }
     }
     lastSeenCurrent = current;
     lastSeenEnd = endUnix;
@@ -2332,7 +2342,12 @@
   // than something we assume: if Torn stops sending a header, it says so instead of
   // silently degrading to a bounded guess.
   function timerSourceLabel() {
-    if (sidebarTimerLive()) return "Exact — read from Torn's own chain bar on this page.";
+    // The chain.end observation is appended to EVERY branch, not just the one that uses
+    // it. On desktop the sidebar always wins, so reporting only that meant the panel
+    // could never tell anyone whether chain.end tracks — the one thing worth knowing.
+    if (sidebarTimerLive()) {
+      return `Exact — read from Torn's own chain bar on this page.${endTracksNote()}`;
+    }
     const src = state.chain?.timeSource;
     const stale = state.chain?.staleSec;
     if (src === "chain.end") {
@@ -2348,12 +2363,14 @@
     if (src === "date") {
       return `Corrected to ~1s using the response Date header (was ~${Math.round(stale || 0)}s cached).`;
     }
-    const watching = state.chain?.endTracks === false
-      ? " Torn's chain.end does NOT move when a hit lands, so it is not the drop deadline and is ignored."
-      : state.chain?.endTracks == null
-        ? " Still watching whether Torn's chain.end moves when a hit lands; until it does, this stays anchored."
-        : "";
-    return `Anchored to the last reading and counting down locally — accurate to within the poll interval.${watching}`;
+    return `Anchored to the last reading and counting down locally — accurate to within the poll interval.${endTracksNote()}`;
+  }
+
+  // What we have observed about chain.end, in one sentence, appended everywhere.
+  function endTracksNote() {
+    if (endTracks === true) return " Torn's chain.end tracks the last hit, so it is the real drop deadline.";
+    if (endTracks === false) return " Torn's chain.end does NOT move when a hit lands, so it is ignored.";
+    return " Still watching whether Torn's chain.end moves when a hit lands.";
   }
 
   function timerUrgencyClass(remaining) {
