@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.25.0
+// @version      0.25.1
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -40,7 +40,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.25.0";
+      : "") || "0.25.1";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -160,7 +160,6 @@
     signup: null,
     chain: null,
     attacks: null,
-    fetchedAt: null,
     // Where the live chain HUD/leaderboard currently come from: "torn" (zero-lag,
     // direct from the member key), "cache" (Overseer fallback), or null (nothing yet).
     liveSource: null,
@@ -295,21 +294,24 @@
 
   // Parse a "60,30,10" thresholds string into a sorted-desc list of positive ints.
   // Returns the fallback when nothing valid is given (fallback may be null → null).
-  function parseThresholds(raw, fallback) {
-    const parts = String(raw || "")
-      .split(/[\s,]+/)
-      .map((s) => parseInt(s, 10))
+  // Valid drop thresholds: whole seconds, 1..3600, deduped, soonest-last. Shared so the
+  // member's typed string and the faction's stored array can never normalise differently.
+  function normalizeThresholds(values) {
+    const nums = values
+      .map((n) => Math.trunc(Number(n)))
       .filter((n) => Number.isInteger(n) && n > 0 && n <= 3600);
-    const uniq = [...new Set(parts)].sort((a, b) => b - a);
-    return uniq.length ? uniq : (fallback ? fallback.slice() : null);
+    const uniq = [...new Set(nums)].sort((a, b) => b - a);
+    return uniq.length ? uniq : null;
+  }
+
+  function parseThresholds(raw, fallback) {
+    return normalizeThresholds(String(raw || "").split(/[\s,]+/))
+      || (fallback ? fallback.slice() : null);
   }
 
   // Clean a faction-supplied threshold array (from watch_config) the same way.
   function cleanThresholdArray(arr) {
-    if (!Array.isArray(arr)) return null;
-    const nums = arr.map((n) => Math.trunc(Number(n))).filter((n) => Number.isFinite(n) && n > 0 && n <= 3600);
-    const uniq = [...new Set(nums)].sort((a, b) => b - a);
-    return uniq.length ? uniq : null;
+    return Array.isArray(arr) ? normalizeThresholds(arr) : null;
   }
 
   // Thresholds + goal are effective = YOUR preference (if set) ?? the FACTION default ??
@@ -400,13 +402,19 @@
     return typeof value === "boolean" ? value : fallback;
   }
 
-  function readPosition() {
-    const value = gmGet(STORE.position, null);
+  // Read a persisted two-number record. The panel position, the panel size and the
+  // launcher position each had their own byte-identical copy of this.
+  function readPair(key, a, b) {
+    const value = gmGet(key, null);
     if (!value || typeof value !== "object") return null;
-    const left = Number(value.left);
-    const top = Number(value.top);
-    if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
-    return { left, top };
+    const av = Number(value[a]);
+    const bv = Number(value[b]);
+    if (!Number.isFinite(av) || !Number.isFinite(bv)) return null;
+    return { [a]: av, [b]: bv };
+  }
+
+  function readPosition() {
+    return readPair(STORE.position, "left", "top");
   }
 
   function clampPosition(left, top, width = 260, height = 120) {
@@ -440,12 +448,7 @@
   const MIN_PANEL_H = 150;
 
   function readSize() {
-    const value = gmGet(STORE.size, null);
-    if (!value || typeof value !== "object") return null;
-    const width = Number(value.width);
-    const height = Number(value.height);
-    if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
-    return { width, height };
+    return readPair(STORE.size, "width", "height");
   }
 
   // Keep a user-chosen panel size inside the viewport (and above a usable floor),
@@ -480,12 +483,7 @@
   const LAUNCHER_H = 38;
 
   function readLauncherPosition() {
-    const value = gmGet(STORE.launcherPos, null);
-    if (!value || typeof value !== "object") return null;
-    const left = Number(value.left);
-    const top = Number(value.top);
-    if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
-    return { left, top };
+    return readPair(STORE.launcherPos, "left", "top");
   }
 
   function applyLauncherPosition(launcher) {
@@ -1395,7 +1393,6 @@
       // Adopt the faction's watcher defaults (0098) from whichever payload we have.
       state.factionConfig = state.watch?.watch_config ?? state.signup?.watch_config ?? null;
       updateChainLifecycle();
-      state.fetchedAt = Date.now();
 
       // Only surface an error when we're left with nothing to show. A failed direct
       // chain poll that still has a backend fallback (or a last value) stays quiet.
@@ -1601,15 +1598,21 @@
     return dom;
   }
 
+  // "Did this happen recently enough to still count?" — the same shape appeared for the
+  // sidebar timer, the sidebar hit count and the schedule payload.
+  function isFresh(at, withinMs) {
+    return at != null && Date.now() - at < withinMs;
+  }
+
   // True while Torn's own chain bar is supplying the hit count (stale-API repair above).
   function sidebarHitsLive() {
-    return state.sidebarHitsSyncedAt != null && Date.now() - state.sidebarHitsSyncedAt < 15000;
+    return isFresh(state.sidebarHitsSyncedAt, 15000);
   }
 
   // True while Torn's own chain bar is feeding us a live countdown. When it is, the drop
   // timer is trustworthy even if the API snapshot behind the hit count has gone stale.
   function sidebarTimerLive() {
-    return state.sidebarSyncedAt != null && Date.now() - state.sidebarSyncedAt < 5000;
+    return isFresh(state.sidebarSyncedAt, 5000);
   }
 
   // Torn doesn't call it a chain until 10 hits land inside the timer — below that you're in
@@ -1746,24 +1749,68 @@
     return "bad";
   }
 
-  // The "Current watcher" / "Next watcher" cards. This must read BOTH payload shapes:
-  // refreshAll nulls state.watch in token mode, so reading only state.watch.shifts left
-  // every link-mode viewer looking at "No watcher assigned" on a fully staffed sheet —
-  // the other half of why clearing the link "fixed" the panel.
+  // --- The shift sheet, in ONE shape -----------------------------------------------
+  // The backend serves shifts two different ways — session mode flattens the watcher onto
+  // the row (watcher_id / backup_watcher_id), token mode nests them (main / backup) — and
+  // five separate functions each re-derived that branch for themselves. Two of them got it
+  // wrong: currentAndNextShift read only the session shape, so every link-mode viewer saw
+  // "No watcher assigned" on a fully staffed sheet, and absentMembers dropped the player id
+  // so names couldn't resolve. Both were the same mistake, made independently.
+  //
+  // So the branch lives here once and nowhere else. A new consumer reads allShifts() and
+  // physically cannot forget a shape.
+  function slotOf(id, name, online, locked) {
+    const pid = num(id);
+    return { id: pid, name: name ?? null, online: online ?? null, filled: pid != null && pid > 0, locked: Boolean(locked) };
+  }
+
+  function allShifts() {
+    if (Array.isArray(state.watch?.shifts)) {
+      return state.watch.shifts.map((s) => ({
+        id: s.id,
+        start: s.shift_start,
+        end: s.shift_end,
+        main: slotOf(s.watcher_id, s.watcher_name, s.watcher_online_status, s.locked),
+        backup: slotOf(s.backup_watcher_id, s.backup_watcher_name, s.backup_watcher_online_status, s.backup_locked),
+      }));
+    }
+    if (Array.isArray(state.signup?.shifts)) {
+      return state.signup.shifts.map((s) => ({
+        id: s.id,
+        start: s.shift_start,
+        end: s.shift_end,
+        // The signup payload carries an explicit `filled`, which is what says a slot is
+        // taken when the id is redacted — so it wins over inferring from the id.
+        main: { ...slotOf(s.main?.watcher_id, s.main?.watcher_name, s.main?.online_status, s.main?.locked), filled: Boolean(s.main?.filled) },
+        backup: { ...slotOf(s.backup?.watcher_id, s.backup?.watcher_name, s.backup?.online_status, s.backup?.locked), filled: Boolean(s.backup?.filled) },
+      }));
+    }
+    return [];
+  }
+
+  // Does this window contain `at`? Five call sites open-coded this comparison.
+  function coversAt(shift, at) {
+    return new Date(shift.start).getTime() <= at && new Date(shift.end).getTime() > at;
+  }
+
+  // The "Current watcher" / "Next watcher" cards. Returns the payload-ish shape those
+  // renderers already expect, built from the one normalized source.
   function currentAndNextShift() {
     const now = Date.now();
-    const shifts = Array.isArray(state.watch?.shifts)
-      ? state.watch.shifts
-      : (Array.isArray(state.signup?.shifts) ? state.signup.shifts : []).map((s) => ({
-          shift_start: s.shift_start,
-          shift_end: s.shift_end,
-          watcher_id: s.main?.watcher_id,
-          watcher_name: s.main?.watcher_name,
-          watcher_online_status: s.main?.online_status,
-        }));
-    const current = shifts.find((s) => new Date(s.shift_start).getTime() <= now && new Date(s.shift_end).getTime() > now) || null;
-    const next = shifts.find((s) => new Date(s.shift_start).getTime() > now) || null;
-    return { current, next };
+    const shifts = allShifts();
+    const asCard = (s) => (s
+      ? {
+          shift_start: s.start,
+          shift_end: s.end,
+          watcher_id: s.main.id,
+          watcher_name: s.main.name,
+          watcher_online_status: s.main.online,
+        }
+      : null);
+    return {
+      current: asCard(shifts.find((s) => coversAt(s, now)) || null),
+      next: asCard(shifts.find((s) => new Date(s.start).getTime() > now) || null),
+    };
   }
 
   // --- Who "you" are, and which of the shifts are yours ------------------------
@@ -1783,16 +1830,9 @@
     const vid = viewerId();
     if (vid == null) return [];
     const out = [];
-    if (Array.isArray(state.watch?.shifts)) {
-      for (const s of state.watch.shifts) {
-        if (Number(s.watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "main" });
-        if (Number(s.backup_watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "backup" });
-      }
-    } else if (Array.isArray(state.signup?.shifts)) {
-      for (const s of state.signup.shifts) {
-        if (s.main && Number(s.main.watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "main" });
-        if (s.backup && Number(s.backup.watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "backup" });
-      }
+    for (const s of allShifts()) {
+      if (s.main.id === vid) out.push({ start: s.start, end: s.end, role: "main" });
+      if (s.backup.id === vid) out.push({ start: s.start, end: s.end, role: "backup" });
     }
     return out.sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
   }
@@ -1801,26 +1841,16 @@
   function viewerShiftStatus() {
     const now = Date.now();
     const mine = viewerShifts();
-    const active = mine.find((s) => new Date(s.start).getTime() <= now && new Date(s.end).getTime() > now) || null;
+    const active = mine.find((s) => coversAt(s, now)) || null;
     const next = mine.find((s) => new Date(s.start).getTime() > now) || null;
     return { active, next };
   }
 
-  // MAIN-slot coverage across both payload shapes: {start, end, id, name, online}.
+  // MAIN-slot view for coverage/handoff: {start, end, id, name, online}.
   function normalizedShifts() {
-    if (Array.isArray(state.watch?.shifts)) {
-      return state.watch.shifts.map((s) => ({
-        start: s.shift_start, end: s.shift_end,
-        id: s.watcher_id, name: s.watcher_name, online: s.watcher_online_status,
-      }));
-    }
-    if (Array.isArray(state.signup?.shifts)) {
-      return state.signup.shifts.map((s) => ({
-        start: s.shift_start, end: s.shift_end,
-        id: s.main?.watcher_id, name: s.main?.watcher_name, online: s.main?.online_status,
-      }));
-    }
-    return [];
+    return allShifts().map((s) => ({
+      start: s.start, end: s.end, id: s.main.id, name: s.main.name, online: s.main.online,
+    }));
   }
 
   // Handoff readiness for the shift that's ending: is the NEXT slot covered by someone
@@ -1831,14 +1861,14 @@
   function handoffStatus() {
     const rows = normalizedShifts();
     const now = Date.now();
-    const current = rows.find((s) => new Date(s.start).getTime() <= now && new Date(s.end).getTime() > now) || null;
+    const current = rows.find((s) => coversAt(s, now)) || null;
     if (!current) return null;
     const handoffAt = new Date(current.end).getTime();
     const endsIn = Math.floor((handoffAt - now) / 1000);
     if (endsIn > HANDOFF_WARN_SECS) return null;
     // The shift that covers the instant this one ends (the contiguous next slot). If
     // nothing covers it, there's an immediate unmanned gap right after the handoff.
-    const cover = rows.find((s) => new Date(s.start).getTime() <= handoffAt && new Date(s.end).getTime() > handoffAt) || null;
+    const cover = rows.find((s) => coversAt(s, handoffAt)) || null;
     // A missing assignment is a fact about the sheet, so it stands even on old data.
     if (!cover || cover.id == null) return { state: "gap", endsIn, name: null, online: null, stale: false };
     // Whether they're ONLINE is not. That comes from the throttled schedule poll, and
@@ -1863,8 +1893,7 @@
   // True when the schedule payload (shifts + roster + online status) is old enough that
   // its online flags shouldn't be treated as current.
   function scheduleStale() {
-    if (state.scheduleConfirmedAt == null) return true;
-    return Date.now() - state.scheduleConfirmedAt > SCHEDULE_STALE_MS;
+    return !isFresh(state.scheduleConfirmedAt, SCHEDULE_STALE_MS);
   }
 
   // "~Xm" ETA to close a gap of `toGo` hits at `pacePerMin`. Empty when unknown.
@@ -1895,29 +1924,36 @@
     }
   }
 
-  function beep(count = 1, freq = 880, type = "square") {
+  // One WebAudio tone sequence. beep() and chime() were 24 near-identical lines each —
+  // same context guard, same peak clamp, same oscillator+gain envelope loop — differing
+  // only in the frequencies, the spacing and how fast each note decayed.
+  function playTones(freqs, { type = "square", spacing = 0.18, decay = 0.15 } = {}) {
     if (!audioCtx) primeAudio();
     if (!audioCtx) return;
     const peak = Math.max(0.0002, state.alarmVolume); // exponential ramps can't hit 0
     try {
       const t0 = audioCtx.currentTime;
-      for (let i = 0; i < count; i += 1) {
-        const at = t0 + i * 0.18;
+      freqs.forEach((f, i) => {
+        const at = t0 + i * spacing;
         const osc = audioCtx.createOscillator();
         const gain = audioCtx.createGain();
         osc.type = type;
-        osc.frequency.value = freq;
+        osc.frequency.value = f;
         gain.gain.setValueAtTime(0.0001, at);
         gain.gain.exponentialRampToValueAtTime(peak, at + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.15);
+        gain.gain.exponentialRampToValueAtTime(0.0001, at + decay);
         osc.connect(gain);
         gain.connect(audioCtx.destination);
         osc.start(at);
-        osc.stop(at + 0.17);
-      }
+        osc.stop(at + decay + 0.02);
+      });
     } catch {
       /* audio can fail on some webviews — never let it break the tick */
     }
+  }
+
+  function beep(count = 1, freq = 880, type = "square") {
+    playTones(new Array(count).fill(freq), { type });
   }
 
   // Named tone presets so watchers can pick a sound they'll actually notice.
@@ -1967,28 +2003,7 @@
 
   // A short rising chime (distinct from the alarm) for bonus celebrations.
   function chime(freqs) {
-    if (!audioCtx) primeAudio();
-    if (!audioCtx) return;
-    const peak = Math.max(0.0002, state.alarmVolume);
-    try {
-      const t0 = audioCtx.currentTime;
-      (freqs || [660, 880, 1174]).forEach((f, i) => {
-        const at = t0 + i * 0.13;
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = f;
-        gain.gain.setValueAtTime(0.0001, at);
-        gain.gain.exponentialRampToValueAtTime(peak, at + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.22);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(at);
-        osc.stop(at + 0.24);
-      });
-    } catch {
-      /* ignore */
-    }
+    playTones(freqs || [660, 880, 1174], { type: "sine", spacing: 0.13, decay: 0.22 });
   }
 
   // Bonus milestone landed: a green flash + rising chime + a celebratory notice.
@@ -2767,31 +2782,26 @@
       state.chainSummary = null;
       render();
     });
-    document.getElementById("tocw-settings")?.addEventListener("click", () => {
+    const openSettings = (focusKey = false) => {
       state.settingsOpen = true;
+      if (focusKey) state.settingsExpandConnection = true;
       render();
-    });
-    document.getElementById("tocw-connect-retry")?.addEventListener("click", () => {
-      retryConnectNow();
-      void refreshAll(true);
-    });
-    document.getElementById("tocw-key-setup")?.addEventListener("click", () => {
-      // Open Settings with Connection & setup already expanded and the key field focused —
-      // otherwise "Open Settings" drops you at the top of a long form with the one field
-      // you need collapsed out of sight at the bottom.
-      state.settingsOpen = true;
-      state.settingsExpandConnection = true;
-      render();
+      if (!focusKey) return;
       const key = document.getElementById("tocw-set-torn-key");
       if (key) {
         key.focus();
         key.scrollIntoView({ block: "center", behavior: "smooth" });
       }
+    };
+    document.getElementById("tocw-settings")?.addEventListener("click", () => openSettings());
+    document.getElementById("tocw-connect-retry")?.addEventListener("click", () => {
+      retryConnectNow();
+      void refreshAll(true);
     });
-    document.getElementById("tocw-hit-setup")?.addEventListener("click", () => {
-      state.settingsOpen = true;
-      render();
-    });
+    // The key gate lands you ON the key field: expanded and focused, rather than at the
+    // top of a long form with the one field you need collapsed out of sight at the bottom.
+    document.getElementById("tocw-key-setup")?.addEventListener("click", () => openSettings(true));
+    document.getElementById("tocw-hit-setup")?.addEventListener("click", () => openSettings());
     document.getElementById("tocw-hit-next")?.addEventListener("click", () => hitNextTarget());
     document.getElementById("tocw-absence-out")?.addEventListener("click", () => void reportOut());
     document.getElementById("tocw-absence-in")?.addEventListener("click", () => void reportIn());
@@ -2937,17 +2947,9 @@
   // silently drop a chain. Works across the session and token payload shapes.
   function coverageGaps() {
     const now = Date.now();
-    const out = [];
-    if (Array.isArray(state.watch?.shifts)) {
-      for (const s of state.watch.shifts) {
-        if (new Date(s.shift_end).getTime() > now && s.watcher_id == null) out.push(s.shift_start);
-      }
-    } else if (Array.isArray(state.signup?.shifts)) {
-      for (const s of state.signup.shifts) {
-        if (new Date(s.shift_end).getTime() > now && !s.main?.filled) out.push(s.shift_start);
-      }
-    }
-    return out;
+    return allShifts()
+      .filter((s) => new Date(s.end).getTime() > now && !s.main.filled)
+      .map((s) => s.start);
   }
 
   function renderCoverage() {
@@ -3000,9 +3002,9 @@
     // "frozen" is the finalized-archive phase renderSignupShifts already keys off; read_only
     // is the flag renderAbsence uses. Either means this sheet can no longer be the live one.
     if (event.read_only || event.phase === "frozen") return true;
-    const shifts = Array.isArray(state.signup?.shifts) ? state.signup.shifts : [];
+    const shifts = allShifts();
     if (!shifts.length) return false;
-    const lastEnd = shifts.reduce((max, s) => Math.max(max, new Date(s.shift_end).getTime() || 0), 0);
+    const lastEnd = shifts.reduce((max, s) => Math.max(max, new Date(s.end).getTime() || 0), 0);
     // An hour's grace so a chain running past its last scheduled slot isn't declared over.
     return lastEnd > 0 && Date.now() - lastEnd > 3600000;
   }
@@ -4302,6 +4304,8 @@
         validateSchedule,
         parseTctInput,
         currentAndNextShift,
+        allShifts,
+        coversAt,
         render,
         renderSlot,
         renderSignupShifts,

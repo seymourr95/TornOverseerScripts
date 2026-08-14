@@ -465,3 +465,98 @@ test("absentMembers carries the player id through on both payload shapes", () =>
   cw.state.signup = { absent: [{ id: 333, name: "Carol" }] };
   assert.equal(cw.absentMembers()[0].id, 333);
 });
+
+// --- allShifts: the one place the two payload shapes are reconciled --------------------
+// Five functions each re-derived this branch and two got it wrong (currentAndNextShift
+// read only the session shape; absentMembers dropped the player id). It lives here now,
+// so these tests guard the single point of failure rather than five copies of it.
+
+test("allShifts yields the same normalized rows from either payload shape", () => {
+  const start = new Date(Date.now() - 3600e3).toISOString();
+  const end = new Date(Date.now() + 3600e3).toISOString();
+
+  resetState();
+  cw.state.watch = {
+    shifts: [{
+      id: 4, shift_start: start, shift_end: end,
+      watcher_id: 111, watcher_name: "Alice", watcher_online_status: "Online", locked: true,
+      backup_watcher_id: 222, backup_watcher_name: "Bob", backup_watcher_online_status: "Idle",
+    }],
+  };
+  const fromSession = cw.allShifts();
+
+  resetState();
+  cw.state.signup = {
+    shifts: [{
+      id: 4, shift_start: start, shift_end: end,
+      main: { watcher_id: 111, watcher_name: "Alice", online_status: "Online", filled: true, locked: true },
+      backup: { watcher_id: 222, watcher_name: "Bob", online_status: "Idle", filled: true },
+    }],
+  };
+  const fromToken = cw.allShifts();
+
+  assert.deepEqual(fromToken, fromSession, "both shapes must normalize identically");
+  assert.equal(fromSession[0].main.name, "Alice");
+  assert.equal(fromSession[0].backup.id, 222);
+  assert.equal(fromSession[0].main.locked, true);
+});
+
+test("allShifts treats an unassigned slot as unfilled in both shapes", () => {
+  const start = new Date().toISOString();
+  const end = new Date(Date.now() + 3600e3).toISOString();
+
+  resetState();
+  cw.state.watch = { shifts: [{ id: 1, shift_start: start, shift_end: end, watcher_id: null }] };
+  assert.equal(cw.allShifts()[0].main.filled, false);
+  assert.equal(cw.coverageGaps().length, 1);
+
+  resetState();
+  cw.state.signup = { shifts: [{ id: 1, shift_start: start, shift_end: end, main: { filled: false } }] };
+  assert.equal(cw.allShifts()[0].main.filled, false);
+  assert.equal(cw.coverageGaps().length, 1);
+});
+
+test("a signup slot marked filled counts as covered even with the id redacted", () => {
+  // The signup payload can report `filled` without exposing who — inferring from the id
+  // alone would call a staffed slot an unmanned gap and fire the coverage alarm.
+  resetState();
+  cw.state.signup = {
+    shifts: [{
+      id: 1,
+      shift_start: new Date().toISOString(),
+      shift_end: new Date(Date.now() + 3600e3).toISOString(),
+      main: { filled: true },
+    }],
+  };
+  assert.equal(cw.allShifts()[0].main.filled, true);
+  assert.equal(cw.coverageGaps().length, 0, "a filled-but-anonymous slot is not a gap");
+});
+
+test("viewerShifts finds both main and backup holdings in either shape", () => {
+  const start = new Date(Date.now() + 3600e3).toISOString();
+  const end = new Date(Date.now() + 7200e3).toISOString();
+
+  resetState();
+  cw.state.watch = {
+    viewer: { player_id: 111 },
+    shifts: [{ id: 1, shift_start: start, shift_end: end, watcher_id: 111, backup_watcher_id: 222 }],
+  };
+  assert.equal(cw.allShifts()[0].main.id, 111);
+  assert.equal(cw.allShifts()[0].backup.id, 222);
+
+  resetState();
+  cw.state.signup = {
+    viewer: { player_id: 222 },
+    shifts: [{ id: 1, shift_start: start, shift_end: end, main: { watcher_id: 111 }, backup: { watcher_id: 222 } }],
+  };
+  assert.equal(cw.allShifts()[0].backup.id, 222);
+});
+
+test("coversAt is inclusive of the start and exclusive of the end", () => {
+  const s = { start: "2026-08-14T12:00:00.000Z", end: "2026-08-14T13:00:00.000Z" };
+  const at = (iso) => new Date(iso).getTime();
+  assert.equal(cw.coversAt(s, at("2026-08-14T12:00:00.000Z")), true, "starts count");
+  assert.equal(cw.coversAt(s, at("2026-08-14T12:30:00.000Z")), true);
+  assert.equal(cw.coversAt(s, at("2026-08-14T13:00:00.000Z")), false, "the end belongs to the next slot");
+  assert.equal(cw.coversAt(s, at("2026-08-14T11:59:59.000Z")), false);
+});
