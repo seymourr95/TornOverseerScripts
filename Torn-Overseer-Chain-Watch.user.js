@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.25.2
+// @version      0.26.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -40,7 +40,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.25.2";
+      : "") || "0.26.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -994,6 +994,21 @@
     return data;
   }
 
+  // An attack only extends a chain if Torn counted it. The attacks feed carries `chain`
+  // (the chain number this hit made, 0 when it made none) and `result`. Losses, escapes,
+  // stalemates and assists never extend a chain, so treating every row as a hit inflated
+  // both the leaderboard and "your hits".
+  //
+  // Only skips on POSITIVE evidence: an absent `chain` field with an unrecognised result
+  // is still counted, so a shape change can't silently empty the board.
+  const NON_CHAIN_RESULTS = new Set(["Lost", "Stalemate", "Escape", "Assist", "Interrupted", "Timeout"]);
+  function countedTowardChain(row) {
+    const chainNo = num(row?.chain);
+    if (chainNo != null) return chainNo > 0;
+    const result = typeof row?.result === "string" ? row.result : "";
+    return !NON_CHAIN_RESULTS.has(result);
+  }
+
   function asRows(value) {
     if (Array.isArray(value)) return value;
     if (value && typeof value === "object") return Object.values(value);
@@ -1090,6 +1105,7 @@
       const defender = row?.defender && typeof row.defender === "object" ? row.defender : {};
       const attackerId = num(row?.attacker_id ?? row?.attackerID ?? attacker.id);
       if (!attackerId || attackerId <= 0) continue; // stealthed / unknown attacker
+      if (!countedTowardChain(row)) continue; // a loss/escape/assist is not a chain hit
       // Only faction members' hits (drops incoming enemy attacks); and only within the
       // current chain's window (drops the previous chain / between-chain randoms).
       if (hasRoster && !rosterIds.has(attackerId)) continue;
@@ -1136,7 +1152,10 @@
         hitters,
       };
     }
-    return { leaderboard, last, error: null, mine: { hits: yourHits, ts: yourTs, respect: yourResp }, pace };
+    // The attacks feed returns only the most recent ~100 attacks, so on a long chain this
+    // is a RECENT WINDOW, not the whole chain. Report the count so the card can say so
+    // rather than letting a 500-hit chain show a leaderboard summing to 100.
+    return { leaderboard, last, error: null, counted: total, mine: { hits: yourHits, ts: yourTs, respect: yourResp }, pace };
   }
 
   // --- Cross-tab coordination ----------------------------------------------------------
@@ -1342,11 +1361,22 @@
         const chainStart = state.chain?.active && state.chain.start > 0
           ? state.chain.start
           : Math.floor(Date.now() / 1000) - 4 * 3600;
+        // Faction members, for filtering INCOMING enemy attacks out of the leaderboard.
+        // This was built from the backend payload's roster — which is empty for an
+        // identity-only session (its cache has a 25s TTL), so rosterIds came back empty,
+        // the filter silently became a no-op, and enemies who hit us appeared as our own
+        // top hitters. Our own roster is the one that's actually populated.
         const rosterIds = new Set(
-          (state.signup?.roster || state.watch?.roster || [])
-            .map((m) => Number(m.id))
+          Object.keys(state.tornRoster || {})
+            .map((id) => Number(id))
             .filter((n) => Number.isFinite(n) && n > 0),
         );
+        if (!rosterIds.size) {
+          for (const m of state.signup?.roster || state.watch?.roster || []) {
+            const n = Number(m?.id);
+            if (Number.isFinite(n) && n > 0) rosterIds.add(n);
+          }
+        }
         let chainFreshness = null;
         tasks.push(
           tornFetch("/faction/chain", {
@@ -3333,9 +3363,14 @@
 
   function renderLeaderboard(attacks) {
     const rows = attacks?.leaderboard || [];
+    // Torn's attacks feed only reaches back ~100 attacks. On a longer chain this board
+    // covers a recent slice, and saying so beats letting the totals look simply wrong.
+    const counted = attacks?.counted ?? null;
+    const chainHits = state.chain?.active ? (state.chain.current || 0) : 0;
+    const partial = counted != null && chainHits > 0 && counted < chainHits;
     return `
       <div class="tocw-card">
-        <div class="tocw-card-title">Leaderboard</div>
+        <div class="tocw-card-title">Leaderboard${partial ? ` <span class="tocw-muted" style="font-weight:400;">— last ${counted} of ${chainHits} hits</span>` : ""}</div>
         ${rows.length ? `
           <div class="tocw-scroll-x">
             <table class="tocw-table">

@@ -591,3 +591,55 @@ test("coversAt is inclusive of the start and exclusive of the end", () => {
   assert.equal(cw.coversAt(s, at("2026-08-14T13:00:00.000Z")), false, "the end belongs to the next slot");
   assert.equal(cw.coversAt(s, at("2026-08-14T11:59:59.000Z")), false);
 });
+
+// --- Leaderboard accuracy -------------------------------------------------------------
+// Two independent faults made this board wrong in the field: the faction-member filter
+// was built from the backend roster (empty for an identity-only session, so it silently
+// became a no-op and enemies who hit US were listed as our top hitters), and every attack
+// row was counted as a chain hit including losses and escapes, which never extend a chain.
+
+test("incoming enemy attacks are excluded when the roster is known", () => {
+  const t = nowSec();
+  const raw = { attacks: [
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "Enemy", respect_gain: 4, timestamp_ended: t - 10, chain: 51 },
+    { attacker_id: 999, attacker_name: "EnemyGuy", defender_name: "Bob", respect_gain: 9, timestamp_ended: t - 20, chain: 0 },
+  ] };
+  const out = cw.parseAttacks(raw, 111, t - 600, new Set([111, 222]));
+  assert.deepEqual(out.leaderboard.map((r) => r.name), ["Alice"]);
+  assert.equal(out.last.attackerName, "Alice", "the last attack must be OURS, not theirs");
+});
+
+test("attacks that did not extend the chain are not counted as hits", () => {
+  const t = nowSec();
+  const raw = { attacks: [
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "A", respect_gain: 4, timestamp_ended: t - 10, chain: 51 },
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "B", respect_gain: 0, timestamp_ended: t - 20, chain: 0, result: "Lost" },
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "C", respect_gain: 0, timestamp_ended: t - 30, result: "Escape" },
+  ] };
+  const out = cw.parseAttacks(raw, 111, t - 600, new Set([111]));
+  assert.equal(out.leaderboard[0].hits, 1, "only the hit with chain > 0 counts");
+  assert.equal(out.mine.hits, 1, "and your own total must match");
+});
+
+test("a row with no chain field and an ordinary result still counts", () => {
+  // Only POSITIVE evidence of a miss should exclude a row — a shape change must not
+  // silently empty the board.
+  const t = nowSec();
+  const raw = { attacks: [
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "A", respect_gain: 4, timestamp_ended: t - 10, result: "Mugged" },
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "B", respect_gain: 4, timestamp_ended: t - 20 },
+  ] };
+  const out = cw.parseAttacks(raw, 111, t - 600, new Set([111]));
+  assert.equal(out.leaderboard[0].hits, 2);
+});
+
+test("parseAttacks reports how many hits the sample actually covers", () => {
+  // Torn returns ~100 attacks, so on a long chain this is a recent window, not the whole
+  // chain — the card says so rather than showing totals that look simply wrong.
+  const t = nowSec();
+  const raw = { attacks: [
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "A", respect_gain: 4, timestamp_ended: t - 10, chain: 51 },
+    { attacker_id: 222, attacker_name: "Bob", defender_name: "B", respect_gain: 3, timestamp_ended: t - 20, chain: 50 },
+  ] };
+  assert.equal(cw.parseAttacks(raw, 111, t - 600, new Set([111, 222])).counted, 2);
+});
