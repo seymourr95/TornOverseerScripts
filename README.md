@@ -5,9 +5,9 @@ intelligence dashboard for [Torn](https://www.torn.com).
 
 ## Torn Overseer Chain Watch (`Torn-Overseer-Chain-Watch.user.js`)
 
-An in-game overlay that adds a Chain Watch panel to torn.com: a scheduled-chain countdown,
-chain-watch shift signup, a live chain timer, and a best-effort hit leaderboard. It's the
-third signup surface alongside the Overseer site and the public per-event signup link.
+An in-game overlay that adds a Chain Watch panel to torn.com: a live drop timer and hit count
+read straight from Torn, the chain-watch shift roster with signup, coverage and handoff
+warnings, opt-in watcher alarms, and a hit leaderboard. Read-only — it never attacks for you.
 
 ### Install
 
@@ -29,25 +29,53 @@ automatically — you don't paste one.
 
 ### Setup
 
-You have two ways in; pick whichever fits.
+**A Torn API key is required.** Add a **limited-access** key (Torn → Settings → API Keys) in
+the panel's **Settings**; on Torn PDA it's provided for you. Everything else happens on its
+own — the panel mints its Overseer session from the key as soon as you save it.
 
-**Link mode —** open a chain-watch signup **link** that leadership posts in faction chat once.
-The panel binds to that event. **Viewing** the sheet, live chain, and leaderboard needs no key.
-**Signing up** authenticates with your limited Torn key (Torn PDA provides it automatically) so
-your claim is recorded as a verified member of the correct faction — no account or site signup
-needed. Add the key once in **Settings** and the link handles the rest.
+The key does two jobs:
 
-**Session mode (managers / full schedule) —**
+- It reads the **live chain, hit count, faction roster and attack log** directly from Torn, so
+  the drop timer matches the game rather than lagging a server cache.
+- It proves you're **in the faction**, which the chain sheet requires before it will show any
+  shifts. The Overseer backend answers an unverified caller with nothing but "verify yourself".
 
-1. Open the Chain Watch panel → **Settings**.
-2. Add a **limited-access** Torn API key (Torn → Settings → API Keys). A limited key is all the
-   script needs — never use a full-access key. On Torn PDA this is provided for you.
-3. Click **Connect site from Torn key** to mint an Overseer session. That's it — the session
-   renews itself automatically when it expires.
+Optionally, paste a chain-watch **signup link** (leadership posts one per event in faction
+chat) under Settings to pin the panel to that specific event. Without a link, the panel shows
+your faction's current chain. A link still needs your key — it selects *which* event, it isn't
+a way in without one. When the linked chain is over, the panel offers a one-click switch back.
 
-The Torn key is used **only** to mint and renew that session. All data the panel shows — the
-schedule, live chain, and hit leaderboard — is served by the Overseer backend, so the script
-**never calls `api.torn.com`** and works without a key of its own once a session or link is set.
+### What it shows
+
+- **Drop timer and hit count**, taken from Torn's own on-page chain bar when it's readable and
+  from the API otherwise, corrected for cache age and for any difference between your clock and
+  Torn's. It says **STALE** rather than showing a frozen number as if it were live.
+- **Chain warm-up** is labelled as such — below 10 hits there is no chain yet.
+- **Shift roster** with signup, current/next watcher, unmanned-shift warnings, and a handoff
+  check before your shift ends. Names link to Torn profiles.
+- **Watcher alarms** (opt-in, off by default): sound, vibration, panel flash, desktop
+  notification and spoken alerts near the drop and around your own shift. Plus focus mode, a
+  screen wake lock, a rotating HIT target list and a paste-to-chat status summary.
+- **Managers** additionally get assign / clear / lock, drafting a chain, and faction-wide
+  watcher defaults. Those are enforced server-side, not just hidden in the UI.
+
+### How your data flows
+
+| What | Where it comes from |
+| --- | --- |
+| Live chain, hit count, roster, attack log | **`api.torn.com` directly, using your key** |
+| Chain schedule, shifts, signups, absences | Overseer backend (Supabase functions) |
+| Fallback chain + leaderboard | Overseer backend, when your own Torn read fails |
+
+Both are reached through the userscript manager (`GM_xmlhttpRequest`) or Torn PDA — never
+through the page's own `fetch` — so torn.com's scripts never see your credentials. The
+`@connect` entries in the metadata block list exactly these two hosts.
+
+**Rate limits:** Torn allows 100 requests/minute **per account**, not per key, so it's shared
+with every other Torn script you run and a second key won't widen it. Chain Watch keeps its
+share low: it eases off when the drop timer isn't close, and only one browser window polls at a
+time — the others read that result. If you still see the rate-limit warning, close spare
+torn.com windows or pause another script.
 
 ### Security
 
@@ -56,17 +84,34 @@ schedule, live chain, and hit leaderboard — is served by the Overseer backend,
   userscript manager isn't available, the script **refuses to store them** rather than fall
   back to page storage. A key left in page storage by an older version is migrated out on first
   run.
+- The Overseer backend **keeps no copy of your key**. It validates the key against Torn to
+  confirm who you are and which faction you're in, then returns a session; the key itself never
+  leaves your device.
 - The PDA-injected key is never persisted.
-- Every request goes through the userscript manager (or Torn PDA) to the **Overseer backend
-  only** — never to `api.torn.com`, and never through the page's own `fetch` — so your
-  credentials are never exposed to the site.
-- Use a **limited-access** key. The script and the Overseer backend never require a full key.
+- Use a **limited-access** key. Neither the script nor the backend ever needs a full key.
+- Non-secret data is different: the chain snapshot is shared between your own browser windows
+  via `localStorage` so they don't each poll Torn. That's the same hit count and timer the page
+  is already showing you — no key, session or token is ever written there.
 
 ### Contributing
 
-Single-file userscript, no build step. Keep it working at every commit (there's no test
-harness — sanity-check the metadata block and `node --check` the file). Bump `@version` **and**
-the `VERSION` constant together. Issues and PRs welcome.
+Single-file userscript, no build step for the script itself.
+
+```bash
+npm install     # dev-only (jsdom, for the render tests)
+npm test        # 54 unit tests
+npm run check   # node --check + tests
+```
+
+Tests cover the pure logic (chain parsing, freshness and clock maths, shift resolution across
+both payload shapes) and the render layer (rebuild behaviour, escaping, permission gating).
+Note that jsdom has no layout engine, so **CSS/layout changes still need checking in a real
+browser, and on a phone** — the tests can't see them.
+
+Bump `@version` in the metadata block. The `VERSION` constant reads from `GM_info` and falls
+back to a literal, so keep that literal in step too, but the header is what actually ships.
+
+Issues and PRs welcome.
 
 ## License
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.20.0
+// @version      0.25.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -22,10 +22,25 @@
 (function () {
   "use strict";
 
-  if (window.__tornOverseerChainWatchLoaded) return;
-  window.__tornOverseerChainWatchLoaded = true;
+  // Under Node (the unit tests) there is no window/document. The pure logic below — chain
+  // parsing, freshness maths, shift resolution — is where the bugs that reached members
+  // actually lived, and none of it needs a DOM. Guarding the two browser-only touchpoints
+  // (this load-once latch, and boot() at the very bottom) makes that logic testable while
+  // staying completely inert in the userscript itself.
+  const IS_BROWSER = typeof window !== "undefined" && typeof document !== "undefined";
+  if (IS_BROWSER) {
+    if (window.__tornOverseerChainWatchLoaded) return;
+    window.__tornOverseerChainWatchLoaded = true;
+  }
 
-  const VERSION = "0.18.0";
+  // Read the version from the userscript header via GM_info so it can NEVER drift from
+  // @version again (it silently sat at 0.18.0 through two releases, which made the
+  // backend's min_script_version handshake declare up-to-date users "out of date" and
+  // disable their actions). The literal is only a fallback for hosts without GM_info.
+  const VERSION =
+    (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
+      ? GM_info.script.version
+      : "") || "0.25.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -43,15 +58,54 @@
   const LIVE_POLL_MS = 3000;
   const IDLE_POLL_MS = 20000;
   const HIDDEN_POLL_MS = 60000;
-  // Torn's own rate limit is 100 req/min/key — throttle the heavier reads so the fast
-  // chain poll leaves plenty of headroom (chain ~20/min, attacks ~10/min, schedule ~2/min).
-  const ATTACKS_MIN_INTERVAL = 6000;
+  // Torn allows 100 req/min per ACCOUNT — not per key, so issuing a second key buys
+  // nothing. That one budget is shared with every window this script runs in AND every
+  // other script the member uses, whatever key each holds. A flat 3s chain poll spent
+  // 20/min of it around the clock, most of it on nothing: the drop timer counts down
+  // locally between polls anyway, so re-confirming it every 3s only buys something near
+  // the drop. Above RELAXED_ABOVE_SEC we ease off; inside it we go back to full speed.
+  //
+  // The handover point carries real margin on purpose. A relaxed reading can overstate the
+  // time left by nearly a full poll interval (~10s), and we then wait another interval
+  // before re-reading — so the switch has to happen ~20s of truth before it matters. At
+  // 120s, fast polling resumes with ~100s genuinely left, comfortably clear of the highest
+  // default alarm threshold (60s). This is the margin that keeps PDA honest, since PDA has
+  // no sidebar countdown to fall back on.
+  const LIVE_POLL_RELAXED_MS = 10000;
+  const RELAXED_ABOVE_SEC = 120;
+  const ATTACKS_MIN_INTERVAL = 10000;
   const SCHEDULE_MIN_INTERVAL = 25000;
+  // Faction roster, fetched with the member's OWN key. This exists because the backend
+  // can no longer resolve names for us: since v0.20.0 the script's session is identity-only
+  // (no key stored server-side), and the backend's roster cache has a 25s TTL — so unless
+  // some keyed caller happened to refresh it in the last 25 seconds, the payload comes back
+  // with an empty roster and every name degrades to "ID 12345" with an unknown online dot.
+  // We hold the key locally, so we can just resolve names ourselves. Rosters change slowly.
+  const ROSTER_MIN_INTERVAL = 300000;
+  // How long a chain snapshot may go unconfirmed before the panel stops presenting it as
+  // live truth. Past this the HUD is badged STALE and says why, instead of quietly showing
+  // a frozen hit count next to a countdown that keeps running. The Torn path re-confirms
+  // every LIVE_POLL_MS so 30s unconfirmed means it's broken; the backend fallback only
+  // refreshes on the throttled schedule poll, so it needs a looser bar not to flap.
+  const CHAIN_STALE_MS = 30000;
+  const CHAIN_STALE_CACHE_MS = 70000;
+  // Backoff for consecutive failed direct-Torn reads, so a rate-limited or broken key is
+  // not hammered every 3s (which is what keeps it rate-limited).
+  const TORN_BACKOFF_MS = [0, 3000, 8000, 20000, 45000];
+  // Notices are EVENTS ("shift claimed", "drops in 10s — HIT NOW"), not conditions, but
+  // nothing expired them: only a manual Refresh cleared state.notice, so an alarm's text
+  // sat in the panel long after it stopped being true. Errors are exempt — refreshAll
+  // clears and re-derives those every poll, so they self-heal.
+  const NOTICE_TTL_MS = 20000;
 
   // Watcher alarms: default seconds-to-drop at which to sound off (once each, per chain
   // run); user-overridable in Settings. Plus how early to warn before your own shift.
   const DEFAULT_DROP_THRESHOLDS = [60, 30, 10];
   const SHIFT_WARN_SECS = 300; // 5-minute heads-up before your shift
+  // Online status arrives on the throttled schedule poll, so it can be much older than the
+  // chain data. Past this the panel stops ASSERTING whether the next watcher is online —
+  // "they aren't online" is a claim worth being sure of before it wakes someone up.
+  const SCHEDULE_STALE_MS = 120000;
   const PACE_MIN_WINDOW_SEC = 10; // don't compute a hit/min pace off too short a sample
   const HANDOFF_WARN_SECS = 600; // start nagging about the next watcher 10m before your shift ends
 
@@ -149,10 +203,46 @@
     // run / shift (cleared when the drop timer resets on a fresh hit, or the chain ends).
     firedDrop: new Set(),
     firedShift: new Set(),
+    // When the schedule payload (shifts, roster, online status) last loaded successfully.
+    scheduleConfirmedAt: null,
+    // Faction roster resolved from OUR key: { [playerId]: { name, status } }. Plain object
+    // (not a Map) so it survives the JSON round-trip through the cross-tab shared snapshot.
+    tornRoster: null,
+    // Inline "schedule a chain" form (replaces three chained window.prompt calls). Held in
+    // state so a background poll re-rendering the panel can't wipe what's been typed.
+    scheduleOpen: false,
+    scheduleForm: { title: "", start: "", hours: "6", error: null },
+    // "Connection & setup" is a <details>. Its open/closed state lives here so a rebuild
+    // can't snap it shut, and so the key gate can send a member straight into it.
+    settingsExpandConnection: false,
+    connectionWasOpen: false,
+    // Inline assign/clear for a shift slot (replaces window.prompt / window.confirm).
+    slotAction: null,
     lastRemaining: null,
     // Consecutive direct-Torn chain failures — used to hint at missing faction API access.
     tornFailCount: 0,
+    // When the chain snapshot on screen was last CONFIRMED by a successful read (Torn or
+    // the backend cache), and the error from the most recent failed read. Without these
+    // a failed poll silently left the last chain on screen — still badged LIVE, hits
+    // frozen, timer counting down off a dead anchor — until the page was reloaded.
+    chainConfirmedAt: null,
+    chainStaleError: null,
+    // When the drop timer / hit count were last re-anchored to torn.com's own chain bar
+    // (see syncChainFromSidebar) — a free truth source that needs no API call. Desktop
+    // offers both; the mobile/PDA bar carries the hit count only, no countdown.
+    sidebarSyncedAt: null,
+    sidebarHitsSyncedAt: null,
+    // Best (tightest) estimate of the wall-clock ms at which the chain drops, plus the hit
+    // count that estimate belongs to. See noteChainTimer — this is what makes the countdown
+    // exact without polling harder, which is the only lever a userscript actually has.
+    chainDeadline: null,
+    chainRunHits: null,
+    // Set when Torn answers with error code 5 (too many requests for this key), which
+    // happens when several torn.com windows each run their own 3s poll on one key.
+    rateLimited: false,
     // Per-chain lifecycle bookkeeping (post-chain summary, bonus celebration, auto-focus).
+    // lastChainId is Torn's own id for the chain run the accumulators below belong to.
+    lastChainId: null,
     wasChainActive: false,
     wasOnWatch: false,
     chainPeak: 0,
@@ -540,6 +630,80 @@
     return parsed;
   }
 
+  // --- Exact response freshness ------------------------------------------------------
+  // A cached response states how stale it is — we were simply throwing the headers away.
+  //
+  //   Age:  seconds this response has sat in a cache. Exact, and independent of the
+  //         member's own clock. This is the signal that makes the countdown exact.
+  //   Date: the server's generation time. Usable too, but it has to have the local clock
+  //         offset removed first (see clockOffsetMs).
+  //
+  // Either one converts Torn's relative `timeout` into an absolute deadline, which is what
+  // lets a countdown stay correct to the second between polls instead of merely bounded.
+  function parseResponseMeta(rawHeaders) {
+    const out = { ageSec: null, serverNowMs: null };
+    const text = String(rawHeaders || "");
+    if (!text) return out;
+    const age = text.match(/^\s*age:\s*(\d+)\s*$/im);
+    if (age) {
+      const n = Number(age[1]);
+      if (Number.isFinite(n) && n >= 0 && n < 3600) out.ageSec = n;
+    }
+    const date = text.match(/^\s*date:\s*(.+)$/im);
+    if (date) {
+      const ms = Date.parse(date[1].trim());
+      if (Number.isFinite(ms)) out.serverNowMs = ms;
+    }
+    return out;
+  }
+
+  // --- Torn's clock vs the member's ----------------------------------------------------
+  // `end` is an absolute instant on TORN's clock, so comparing it against Date.now() is
+  // only valid once the member's clock skew is removed — phones drift, and a naive
+  // (end − now) on a clock that is 47s fast reports 47s less than there really is, firing
+  // the drop alarm after the chain has already died.
+  //
+  // The offset comes free from the same response: (end − timeout) is Torn's generation
+  // time, so (local receipt − that) is skew + network latency + any cache age. Taking the
+  // MINIMUM across recent samples filters the latency and cache age away — they are only
+  // ever additive — leaving the skew. A short ring buffer rather than an all-time minimum,
+  // so that a phone whose clock gets corrected mid-session re-converges instead of being
+  // pinned to an offset that is no longer true.
+  const CLOCK_SAMPLES = 20;
+  const clockOffsets = [];
+  function noteServerClock(endUnix, timeoutSec, localRecvSec) {
+    if (!(endUnix > 0) || !(timeoutSec > 0)) return;
+    const offset = localRecvSec - (endUnix - timeoutSec);
+    if (!Number.isFinite(offset) || Math.abs(offset) > 86400) return; // implausible
+    clockOffsets.push(offset);
+    if (clockOffsets.length > CLOCK_SAMPLES) clockOffsets.shift();
+  }
+  function serverClockOffsetSec() {
+    return clockOffsets.length ? Math.min(...clockOffsets) : null;
+  }
+  // Test-only: the ring is module state shared by every caller, so a unit test measuring
+  // skew has to start from empty. Unused by the userscript itself.
+  function resetClockSamplesForTests() {
+    clockOffsets.length = 0;
+  }
+
+  // Running minimum of (local receipt − server Date). That minimum converges to the
+  // member's clock skew plus the best-case network latency, both of which are constant
+  // offsets — so subtracting it leaves the part that actually varies: cache staleness.
+  // Clock-skew immune without needing the member's clock to be right.
+  let clockOffsetMs = null;
+  function stalenessFromMeta(meta, receivedAtMs) {
+    if (!meta) return null;
+    if (meta.ageSec != null) return { sec: meta.ageSec, source: "age" };
+    if (meta.serverNowMs != null) {
+      const delta = receivedAtMs - meta.serverNowMs;
+      if (clockOffsetMs == null || delta < clockOffsetMs) clockOffsetMs = delta;
+      // The Date header has 1-second resolution, so this is accurate to about a second.
+      return { sec: Math.max(0, (delta - clockOffsetMs) / 1000), source: "date" };
+    }
+    return null;
+  }
+
   async function requestJsonWithTornPda(url, options = {}) {
     const method = options.method || "GET";
     const headers = options.headers || {};
@@ -551,7 +715,24 @@
       : await get(url, headers);
     const status = Number(res?.status ?? res?.statusCode ?? 200);
     const responseText = String(res?.responseText ?? res?.body ?? res ?? "");
+    // PDA's bridge may or may not surface headers, and spells it differently from GM.
+    // Try what's plausible and degrade quietly — a missing header just means we fall back
+    // to the bounded estimate rather than the exact one.
+    if (typeof options.onMeta === "function") {
+      const raw = res?.responseHeaders ?? res?.headers ?? res?.allResponseHeaders ?? "";
+      options.onMeta(parseResponseMeta(typeof raw === "string" ? raw : headerObjectToText(raw)), Date.now());
+    }
     return parseHttpJson(status, responseText, url);
+  }
+
+  // PDA may hand headers back as an object rather than the raw header block.
+  function headerObjectToText(obj) {
+    if (!obj || typeof obj !== "object") return "";
+    try {
+      return Object.entries(obj).map(([k, v]) => `${k}: ${v}`).join("\n");
+    } catch {
+      return "";
+    }
   }
 
   function requestJson(url, options = {}) {
@@ -582,6 +763,9 @@
         timeout: options.timeout || 25000,
         onload: (res) => {
           try {
+            if (typeof options.onMeta === "function") {
+              options.onMeta(parseResponseMeta(res.responseHeaders), Date.now());
+            }
             resolve(parseHttpJson(res.status, res.responseText, url));
           } catch (error) {
             reject(error);
@@ -697,6 +881,13 @@
       timeout,
       modifier: num(lc.modifier) ?? 0,
       cooldown: num(lc.cooldown) ?? 0,
+      // Carry the chain start through when the backend sends it, so the leaderboard stays
+      // windowed to THIS chain on the cache fallback too (without it the window silently
+      // widened to a rolling 4h and mixed in the previous chain's hits).
+      start: num(lc.start) ?? 0,
+      // The backend block carries no absolute drop instant, so the countdown falls back to
+      // the timeout anchored at the server's cache time.
+      deadlineLocalMs: null,
       fetchedAt: Number.isFinite(cachedAt) ? cachedAt : Date.now(),
     };
   }
@@ -712,6 +903,7 @@
     }
     const rows = Array.isArray(block.leaderboard) ? block.leaderboard : [];
     const leaderboard = rows.map((r) => ({
+      playerId: num(r?.player_id) ?? null,
       name: String(r?.name ?? (r?.player_id != null ? `ID ${r.player_id}` : "Unknown")),
       hits: num(r?.hits) ?? 0,
       respect: num(r?.respect) ?? 0,
@@ -720,7 +912,7 @@
     const l = block.last;
     const ts = l && typeof l === "object" ? num(l.timestamp) : null;
     const last = ts != null && ts > 0
-      ? { attackerName: String(l.attackerName ?? "?"), defenderName: String(l.defenderName ?? "target"), timestamp: ts }
+      ? { attackerId: num(l.attackerId ?? l.player_id) ?? null, attackerName: String(l.attackerName ?? "?"), defenderName: String(l.defenderName ?? "target"), timestamp: ts }
       : null;
     return { leaderboard, last, error: null };
   }
@@ -730,18 +922,26 @@
   // so the key stays private but the chain HUD + leaderboard match torn.com with no
   // backend cache lag. The Overseer backend remains the fallback (see refreshAll).
 
-  async function tornFetch(path) {
+  async function tornFetch(path, opts = {}) {
     const cfg = settings();
     if (!cfg.tornKey) throw new Error("Add a Torn API key in Settings.");
     const url = new URL(`https://api.torn.com/v2${path.startsWith("/") ? path : `/${path}`}`);
     url.searchParams.set("key", cfg.tornKey);
     url.searchParams.set("comment", COMMENT);
-    const data = await requestJson(url.toString());
-    if (data && typeof data === "object" && data.error) {
-      const err = data.error;
-      throw new Error(err.error || `Torn API error ${err.code ?? ""}`.trim());
-    }
+    const data = await requestJson(url.toString(), opts.onMeta ? { onMeta: opts.onMeta } : {});
+    if (data && typeof data === "object" && data.error) throw tornApiError(data.error);
     return data;
+  }
+
+  // Torn signals its own failures in a 200 body. Code 5 is "too many requests" — worth
+  // tagging, because the panel's own 3s poll is the usual cause and the fix (back off,
+  // close spare torn.com windows) is different from a key/permission problem.
+  function tornApiError(err) {
+    const code = num(err?.code);
+    const error = new Error(err?.error || `Torn API error ${code ?? ""}`.trim());
+    error.tornCode = code;
+    error.rateLimited = code === 5;
+    return error;
   }
 
   async function tornLegacyFaction(selections) {
@@ -752,10 +952,7 @@
     url.searchParams.set("key", cfg.tornKey);
     url.searchParams.set("comment", COMMENT);
     const data = await requestJson(url.toString());
-    if (data && typeof data === "object" && data.error) {
-      const err = data.error;
-      throw new Error(err.error || `Torn API error ${err.code ?? ""}`.trim());
-    }
+    if (data && typeof data === "object" && data.error) throw tornApiError(data.error);
     return data;
   }
 
@@ -767,19 +964,61 @@
 
   // Torn /v2/faction/chain -> the panel's chain shape, stamped with the moment WE got
   // the response so the local drop-timer countdown stays honest between polls.
-  function parseChain(raw) {
+  function parseChain(raw, freshness) {
     const c = raw?.chain || raw || {};
     const current = num(c.current) ?? 0;
-    const timeout = num(c.timeout) ?? 0;
+    const rawTimeout = num(c.timeout) ?? 0;
+    // Subtract the response's own measured staleness, so `timeout` describes NOW rather
+    // than whenever the cache generated it. Without this the countdown always ran late
+    // (reporting more time than there was) by however long the response had been cached.
+    const stale = freshness && Number.isFinite(freshness.sec) ? Math.max(0, freshness.sec) : 0;
+    const timeout = rawTimeout > 0 ? Math.max(0, rawTimeout - stale) : 0;
+    // `timeout` is seconds remaining AS OF THE INSTANT TORN GENERATED THE RESPONSE — which
+    // is exactly why a cached response runs late. `end` is absolute unix seconds. So if
+    // `end` is that same instant expressed absolutely, then:
+    //
+    //     end − timeout  ==  the moment Torn generated this response
+    //
+    // That single subtraction does two jobs at once. It VALIDATES the interpretation (the
+    // result has to land a plausible moment ago), and it yields the exact staleness — from
+    // the body, needing no `Age` or `Date` header, which matters because PDA's bridge may
+    // not expose headers at all. Requiring the difference to land in a just-now window is
+    // also a far stronger guard than asking whether `end` merely looks near-future: a
+    // stale `end` from a previous chain, or an `end` meaning something else entirely,
+    // won't line up with `timeout` by coincidence.
+    const endUnix = num(c.end) ?? 0;
+    const nowSec = Date.now() / 1000;
+    noteServerClock(endUnix, rawTimeout, nowSec);
+    const offset = serverClockOffsetSec();
+    const genUnix = endUnix > 0 && rawTimeout > 0 ? endUnix - rawTimeout : 0;
+    // Age of this response, on a common clock: how far its generation time sits behind
+    // now, once the member's skew is taken out. Near zero for an uncached endpoint.
+    const genAge = genUnix > 0 && offset != null ? nowSec - offset - genUnix : null;
+    // Allow a little negative slack for jitter, and up to 3 minutes of cache age.
+    const endUsable = genAge != null && genAge >= -5 && genAge <= 180;
+    // The drop instant expressed on the MEMBER's clock, so the per-second countdown can
+    // just subtract Date.now() forever — no re-anchoring, no drift, nothing to go stale.
+    const deadlineLocalMs = endUsable ? (endUnix + offset) * 1000 : null;
     return {
-      active: current > 0 && timeout > 0,
+      active: current > 0 && rawTimeout > 0,
       current,
+      // Torn's own identifier for THIS chain run. An exact identity signal, which beats
+      // inferring "is this still the same chain?" from the hit count going up or down.
+      id: num(c.id) ?? 0,
       max: num(c.maximum ?? c.max) ?? 0,
-      timeout,
+      timeout: deadlineLocalMs != null ? Math.max(0, Math.round((deadlineLocalMs - Date.now()) / 1000)) : timeout,
+      deadlineLocalMs,
       modifier: num(c.modifier) ?? 0,
       cooldown: num(c.cooldown) ?? 0,
       start: num(c.start) ?? 0, // unix seconds the chain began — windows the leaderboard
+      end: endUnix,
       fetchedAt: Date.now(),
+      // Which mechanism gave us this countdown, best first — surfaced in the UI so a
+      // member (and we) can tell at a glance whether it's exact or merely bounded.
+      timeSource: endUsable ? "chain.end" : freshness?.source || "uncorrected",
+      // How long this response had been cached. Derived from (end − timeout) when that
+      // checks out, otherwise measured from the headers. Reported in the UI either way.
+      staleSec: endUsable ? Math.max(0, genAge) : stale,
     };
   }
 
@@ -831,7 +1070,7 @@
         if (timestamp > maxTs) maxTs = timestamp;
       }
       if (timestamp > 0 && (!last || timestamp > last.timestamp)) {
-        last = { attackerName, defenderName, timestamp };
+        last = { attackerId, attackerName, defenderName, timestamp };
       }
     }
     const leaderboard = [...byId.values()]
@@ -857,10 +1096,128 @@
     return { leaderboard, last, error: null, mine: { hits: yourHits, ts: yourTs, respect: yourResp }, pace };
   }
 
-  // Freshness bookkeeping so the two heavier reads (attacks, backend schedule) run on
+  // --- Cross-tab coordination ----------------------------------------------------------
+  // Torn's 100 req/min budget is per ACCOUNT, so it cannot be widened by handing out more
+  // keys — spending less is the only lever there is. Every open torn.com window was running
+  // its own poll loop, so two visible windows doubled our share of that one budget for no
+  // benefit, both fetching the identical chain.
+  //
+  // So exactly one tab polls Torn. It takes a short lease in localStorage and publishes
+  // each result there; the others read the published snapshot instead of calling the API.
+  // The lease is short and the leader drops it the moment it's backgrounded, so whichever
+  // window the member is actually looking at takes over within a few seconds.
+  //
+  // localStorage is safe HERE specifically because the chain snapshot is not a secret —
+  // it's the same hit count and timer torn.com is already rendering on the page. Keys and
+  // session tokens remain GM-storage-only (SECRET_KEYS); nothing sensitive is published.
+  const LEADER_KEY = "tocw_poll_leader";
+  const SHARED_KEY = "tocw_shared_chain";
+  const LEADER_LEASE_MS = 9000;
+  const SHARED_MAX_AGE_MS = 30000;
+  const TAB_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+  function lsGet(key) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+  function lsSet(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      /* private mode / quota — fall back to every tab polling for itself */
+    }
+  }
+
+  // Take or renew the polling lease. Returns true when this tab should hit Torn. A hidden
+  // tab never contends, so the visible window always wins within one lease period.
+  function claimPollLeader() {
+    if (typeof localStorage === "undefined") return true; // no coordination available
+    if (document.visibilityState !== "visible") return false;
+    const lease = lsGet(LEADER_KEY);
+    const fresh = lease && Number.isFinite(lease.at) && Date.now() - lease.at < LEADER_LEASE_MS;
+    if (fresh && lease.id !== TAB_ID) return false;
+    lsSet(LEADER_KEY, { id: TAB_ID, at: Date.now() });
+    return true;
+  }
+
+  function releasePollLeader() {
+    const lease = lsGet(LEADER_KEY);
+    if (lease && lease.id === TAB_ID) lsSet(LEADER_KEY, { id: TAB_ID, at: 0 });
+  }
+
+  function publishSharedChain() {
+    if (!state.chain) return;
+    lsSet(SHARED_KEY, { at: Date.now(), by: TAB_ID, chain: state.chain, attacks: state.attacks, roster: state.tornRoster });
+  }
+
+  // The follower path: adopt what the leader last published, if it's recent enough to be
+  // worth more than our own (absent) data.
+  function readSharedChain() {
+    const shared = lsGet(SHARED_KEY);
+    if (!shared || !Number.isFinite(shared.at)) return null;
+    if (Date.now() - shared.at > SHARED_MAX_AGE_MS) return null;
+    if (!shared.chain || typeof shared.chain !== "object") return null;
+    return shared;
+  }
+
+  // Torn /v2/faction/members -> { [id]: { name, status } }. Handles both the v2 array and
+  // the legacy id-keyed object, and takes `last_action.status` (Online/Idle/Offline) which
+  // is what the panel's status dot means — not `status`, which is hospital/jail/okay.
+  function parseRoster(raw) {
+    const rows = asRows(raw?.members ?? raw);
+    const out = {};
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const id = num(row.id ?? row.player_id ?? row.user_id);
+      const name = typeof row.name === "string" ? row.name.trim() : "";
+      if (!id || id <= 0 || !name) continue;
+      const la = row.last_action && typeof row.last_action === "object" ? row.last_action : null;
+      const status = typeof la?.status === "string" ? la.status : null;
+      out[id] = { name, status };
+    }
+    return Object.keys(out).length ? out : null;
+  }
+
+  // Freshness bookkeeping so the heavier reads (attacks, roster, backend schedule) run on
   // their own slower cadence than the fast chain poll.
   let lastAttacksAt = 0;
   let lastScheduleAt = 0;
+  let lastRosterAt = 0;
+
+  // A key with no session was a dead end: panelMode() returns "none", so NEITHER schedule
+  // branch in refreshAll ran, nothing ever minted a session, and the panel sat telling the
+  // member to go and do it by hand — forever, because nothing was actually connecting.
+  //
+  // Adding the key is the consent step; there's nothing further to ask. So mint the session
+  // from it automatically. Throttled, because a key that Torn rejects (typo, wrong
+  // permissions, not in a faction) must not turn into a connect-torn-key call every poll.
+  const CONNECT_RETRY_MS = 60000;
+  let lastConnectAttemptAt = 0;
+  let connectError = null;
+
+  async function ensureSessionFromKey() {
+    const cfg = settings();
+    if (cfg.sessionToken || !cfg.tornKey) return;
+    if (lastConnectAttemptAt && Date.now() - lastConnectAttemptAt < CONNECT_RETRY_MS) return;
+    lastConnectAttemptAt = Date.now();
+    try {
+      await connectSiteFromTornKey();
+      connectError = null;
+    } catch (e) {
+      connectError = e.message || "Could not verify your key with the Overseer site.";
+    }
+  }
+
+  // Called when a key is entered or an explicit retry is requested, so neither has to wait
+  // out the throttle above.
+  function retryConnectNow() {
+    lastConnectAttemptAt = 0;
+    connectError = null;
+  }
 
   async function refreshAll(manual = false) {
     // Only the manual button shows a spinner — a background poll every few seconds
@@ -868,10 +1225,15 @@
     if (manual) {
       state.loading = true;
       state.notice = null;
-      render();
+      render({ background: true }); // spinner only — must not disturb an open form
     }
     state.error = null;
     try {
+      // Mint the session from the key BEFORE reading panelMode, so it resolves to
+      // "session" on this very pass instead of sitting in "none" and skipping both
+      // schedule branches. An explicit Refresh always retries, throttle or not.
+      if (manual) retryConnectNow();
+      await ensureSessionFromKey();
       const cfg = settings();
       const mode = panelMode();
       const now = Date.now();
@@ -895,7 +1257,7 @@
       if (wantSchedule && mode === "session") {
         tasks.push(
           callFunction("chain-watch", { action: "get" })
-            .then((res) => { serverRes = res; state.watch = res; lastScheduleAt = Date.now(); })
+            .then((res) => { serverRes = res; state.watch = res; lastScheduleAt = Date.now(); state.scheduleConfirmedAt = Date.now(); })
             .catch((e) => { scheduleErr = e; if (!state.watch) state.watch = null; }),
         );
       } else if (wantSchedule && mode === "token") {
@@ -908,14 +1270,30 @@
         }
         tasks.push(
           callSignup("get", {}, st || undefined)
-            .then((res) => { serverRes = res; state.signup = res; lastScheduleAt = Date.now(); })
+            .then((res) => { serverRes = res; state.signup = res; lastScheduleAt = Date.now(); state.scheduleConfirmedAt = Date.now(); })
             .catch((e) => { scheduleErr = e; if (!state.signup) state.signup = null; }),
         );
       }
 
       // 2) Zero-lag live data STRAIGHT from Torn (member key). This is the primary
       //    source whenever a key is present; the backend block is only a fallback.
-      if (hasKey) {
+      //    Only the lease-holding tab actually calls Torn — see claimPollLeader.
+      const isLeader = hasKey ? claimPollLeader() : false;
+      if (hasKey && !isLeader) {
+        // A follower: take the leader's published snapshot rather than spending another
+        // slice of the shared 100/min budget on the identical request.
+        const shared = readSharedChain();
+        if (shared) {
+          state.chain = shared.chain;
+          if (shared.attacks) state.attacks = shared.attacks;
+          if (shared.roster) state.tornRoster = shared.roster; // names too, not just the chain
+          state.liveSource = "torn";
+          state.tornFailCount = 0;
+          state.chainConfirmedAt = shared.at;
+          state.chainStaleError = null;
+        }
+      }
+      if (hasKey && isLeader) {
         // Window the leaderboard to the running chain (its start), else a rolling 4h;
         // filter to faction members so incoming enemy hits don't pollute it.
         const chainStart = state.chain?.active && state.chain.start > 0
@@ -926,11 +1304,27 @@
             .map((m) => Number(m.id))
             .filter((n) => Number.isFinite(n) && n > 0),
         );
+        let chainFreshness = null;
         tasks.push(
-          tornFetch("/faction/chain")
-            .then((raw) => { tornChain = parseChain(raw); })
+          tornFetch("/faction/chain", {
+            onMeta: (meta, receivedAt) => { chainFreshness = stalenessFromMeta(meta, receivedAt); },
+          })
+            .then((raw) => { tornChain = parseChain(raw, chainFreshness); })
             .catch((e) => { tornChainErr = e; }),
         );
+        // Names + online status, resolved from our own key because the backend's
+        // identity-only session usually can't (see ROSTER_MIN_INTERVAL). Slow cadence:
+        // a roster changes far less often than a chain does.
+        if (manual || now - lastRosterAt >= ROSTER_MIN_INTERVAL) {
+          tasks.push(
+            tornFetch("/faction/members")
+              .then((raw) => {
+                const roster = parseRoster(raw);
+                if (roster) { state.tornRoster = roster; lastRosterAt = Date.now(); }
+              })
+              .catch(() => { /* no faction access — fall back to whatever names the payload has */ }),
+          );
+        }
         if (wantAttacks) {
           tasks.push(
             tornLegacyFaction("attacks")
@@ -958,11 +1352,27 @@
         state.chain = tornChain;
         state.liveSource = "torn";
         state.tornFailCount = 0;
-      } else {
-        if (hasKey) state.tornFailCount += 1; // ran the direct fetch, got nothing usable
-        if (serverRes) {
-          const cached = serverLiveChain(serverRes);
-          if (cached) { state.chain = cached; state.liveSource = "cache"; }
+        state.rateLimited = false;
+        state.chainConfirmedAt = Date.now();
+        state.chainStaleError = null;
+        publishSharedChain(); // hand it to the other windows so they need not fetch
+      } else if (!hasKey || isLeader) {
+        // Only count a failure when we actually attempted the fetch. A follower that
+        // simply has no shared snapshot yet hasn't failed at anything.
+        if (hasKey) state.tornFailCount += 1;
+        if (tornChainErr?.rateLimited) state.rateLimited = true;
+        const cached = serverRes ? serverLiveChain(serverRes) : null;
+        if (cached) {
+          state.chain = cached;
+          state.liveSource = "cache";
+          state.chainConfirmedAt = Date.now();
+          state.chainStaleError = null;
+        } else if (state.chain) {
+          // Nothing fresh from either source. Keep the last snapshot on screen (one bad
+          // poll must not blank a live timer) but remember WHY it wasn't confirmed —
+          // render() downgrades it to STALE once it ages past CHAIN_STALE_MS rather than
+          // letting a frozen hit count keep wearing the LIVE badge.
+          state.chainStaleError = tornChainErr || state.chainStaleError;
         }
       }
 
@@ -971,6 +1381,15 @@
         state.attacks = tornAttacks;
       } else if (serverRes) {
         state.attacks = serverLeaderboard(serverRes);
+      }
+
+      // Fold this poll's chain reading into the cache-corrected deadline estimate (hits
+      // first, so a landed hit clears the now-void bounds before the new bound lands).
+      if (state.chain?.active) {
+        noteChainHits(currentHitsBest());
+        noteChainTimer(state.chain.timeout);
+      } else {
+        clearChainEstimate();
       }
 
       // Adopt the faction's watcher defaults (0098) from whichever payload we have.
@@ -987,9 +1406,12 @@
       } else if (tornChainErr && !state.chain) {
         state.error = tornChainErr.message || "Could not load the live chain from Torn.";
       }
+      // A stale-but-present chain used to stay silent (the branch above only fires with
+      // NO chain at all), which is exactly how the panel drifted out of sync without
+      // ever saying so. renderChainStale() now speaks for that case.
     } finally {
       state.loading = false;
-      render();
+      render({ background: true });
       scheduleNextRefresh();
     }
   }
@@ -1004,9 +1426,18 @@
     const canLive = Boolean(settings().tornKey) && Boolean(state.chain?.active);
     // Keep polling fast even while hidden IF alarms are armed on a live chain — an alarm
     // is only as accurate as the last chain fetch, so it must not go stale in a pocket.
-    const delay = canLive && (!state.hidden || state.alarm)
-      ? LIVE_POLL_MS
+    // Near the drop every second counts; with minutes on the clock it doesn't. The timer
+    // itself keeps ticking locally (and off Torn's own chain bar when it's readable), so
+    // easing off here costs no accuracy where it matters.
+    const livePoll = chainRemaining() > RELAXED_ABOVE_SEC ? LIVE_POLL_RELAXED_MS : LIVE_POLL_MS;
+    const base = canLive && (!state.hidden || state.alarm)
+      ? livePoll
       : state.hidden ? HIDDEN_POLL_MS : IDLE_POLL_MS;
+    // Back off after consecutive direct-Torn failures. Polling a rate-limited key every
+    // 3s is what KEEPS it limited — the 100 req/min is per ACCOUNT, so it is shared with
+    // every other window and every other script the member is running.
+    const backoff = TORN_BACKOFF_MS[Math.min(state.tornFailCount, TORN_BACKOFF_MS.length - 1)];
+    const delay = Math.max(base, backoff);
     refreshTimer = setTimeout(() => {
       // Poll whenever the TAB is foreground (panel hidden is fine — alarms/data still
       // need refreshing); a backgrounded tab pauses (browsers throttle it anyway).
@@ -1018,27 +1449,88 @@
     }, delay);
   }
 
-  // torn.com's own sidebar shows the chain countdown, updated live by the site — the
-  // exact value the player sees, with zero API-cache lag. Read it so our drop timer
-  // matches. Torn renders each bar's countdown in a `bar-timeleft___<hash>` element,
-  // and ALL bars (Energy/Nerve/Happy/Chain) share it — so pick the timer whose bar (an
-  // ancestor within a few levels, kept small) says "Chain". Returns seconds, or null
-  // when there's no such element (wrong page / PDA) → the API value is used instead.
+  // torn.com renders its own chain bar, and it's the exact thing the player is looking
+  // at — zero API-cache lag and zero API cost. Both layouts use a CSS-module class whose
+  // prefix is stable, `chain-bar___<hash>`, which is a far better anchor than hunting for
+  // a countdown and walking up looking for the word "chain":
+  //
+  //   desktop  <div class="chain-bar___…">   … <div class="bar-timeleft___…">4:32</div>
+  //   mobile   <a   class="chain-bar___… bar-mobile___…" href="…#/war/chain">
+  //                                          … <p class="bar-value___…">1 / 10</p>
+  //
+  // The mobile/PDA bar carries NO countdown at all — only "hits / next-bonus". So mobile
+  // gets its HIT COUNT free from the DOM but still needs the API for the drop timer,
+  // while desktop gets both. Each reader returns null when its element isn't there.
+  //
+  // Mobile DOES have a countdown in the bar's tooltip ("Chain: 1 / 10 (00:17)"), but that
+  // is a floating-ui popover mounted on demand — the bar carries data-is-tooltip-opened,
+  // and the node only exists while it's open. So it is not something to depend on, and we
+  // never synthesise a hover to force it. It sits outside the bar, so the scoped read
+  // can't see it; the global fallback below picks it up on its own whenever a member
+  // happens to have it open (its <p> reads "Chain: 1 / 10 (00:17)", which satisfies the
+  // ancestor-names-the-chain test). Free when it's there, never relied upon.
+  // ALL chain bars, not just the first: Torn can have both the desktop and the mobile bar
+  // in the DOM with one hidden by CSS, and the hidden one may not be populated. So the
+  // readers try each in turn and take the first that actually yields a value.
+  function chainBarNodes() {
+    try {
+      return document.querySelectorAll('[class*="chain-bar"]');
+    } catch {
+      return [];
+    }
+  }
+
+  // "1 / 10" → 1. The denominator is Torn's next-bonus target, which we compute ourselves
+  // (nextBonus), so only the current count is taken.
+  function readSidebarChainHits() {
+    try {
+      for (const bar of chainBarNodes()) {
+        const value = bar.querySelector('[class*="bar-value"]');
+        const m = (value?.textContent || "").trim().match(/^(\d{1,7})\s*\/\s*\d{1,7}$/);
+        if (!m) continue;
+        const hits = Number(m[1]);
+        if (Number.isInteger(hits) && hits >= 0) return hits;
+      }
+    } catch {
+      /* DOM shape changed — fall back to the API value */
+    }
+    return null;
+  }
+
   let sidebarChainNode = null;
+  // "M:SS" → seconds, rejecting anything outside the chain timer's real 0–5:00 range
+  // (Energy counts to 15:00, so the range alone rules the other bars out). Self-contained:
+  // it never compares against our API value, which may itself be stale.
+  function timerTextSeconds(el) {
+    const m = (el?.textContent || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+    const secs = Number(m[1]) * 60 + Number(m[2]);
+    return secs >= 0 && secs <= 300 ? secs : null;
+  }
+
+  // Fallback identification for a countdown found OUTSIDE a recognised chain bar: accept
+  // it only if a nearby ancestor names the chain.
   function chainTimerSeconds(timer) {
     if (!timer) return null;
-    const m = (timer.textContent || "").trim().match(/^(\d{1,2}):(\d{2})$/);
-    if (!m) return null;
+    const secs = timerTextSeconds(timer);
+    if (secs == null) return null;
     let node = timer.parentElement;
     for (let i = 0; i < 5 && node; i += 1, node = node.parentElement) {
       const t = (node.textContent || "").replace(/\s+/g, " ").trim();
       if (t.length > 80) break; // walked past this single bar into its neighbours
-      if (/chain/i.test(t)) return Number(m[1]) * 60 + Number(m[2]);
+      if (/chain/i.test(t)) return secs;
     }
     return null;
   }
+  // Seconds to drop, or null. Preferred path is the chain bar's OWN countdown (scoped to
+  // the container, so no other bar can be mistaken for it). The old global hunt stays as a
+  // fallback for any layout where the chain-bar class isn't what we expect.
   function readSidebarChainSeconds() {
     try {
+      for (const bar of chainBarNodes()) {
+        const secs = timerTextSeconds(bar.querySelector('[class*="timeleft"]'));
+        if (secs != null) return secs;
+      }
       if (sidebarChainNode && sidebarChainNode.isConnected) {
         const secs = chainTimerSeconds(sidebarChainNode);
         if (secs != null) return secs;
@@ -1057,14 +1549,142 @@
     return null;
   }
 
+  // How long since the on-screen chain snapshot was last confirmed by a successful read,
+  // and whether that's long enough to stop calling it live. Everything the panel shows
+  // from state.chain (hit count, drop timer, bonus progress) is only as true as this.
+  function chainStaleness() {
+    if (!state.chain) return { ageMs: 0, stale: false };
+    const at = state.chainConfirmedAt ?? state.chain.fetchedAt ?? null;
+    if (at == null) return { ageMs: 0, stale: false };
+    const ageMs = Date.now() - at;
+    const limit = state.liveSource === "cache" ? CHAIN_STALE_CACHE_MS : CHAIN_STALE_MS;
+    return { ageMs, stale: ageMs > limit };
+  }
+
+  // Torn's own chain bar is the player-visible truth, it ticks every second, and it costs
+  // no API call. Once chainTimerSeconds has confidently identified it (the bar's own text
+  // says "Chain", and the value is inside the chain timer's real 0–300s range) it OUTRANKS
+  // our API snapshot — so re-anchor to it. This also keeps the API-derived countdown honest
+  // for the moments the bar isn't readable (PDA, pages without the sidebar).
+  //
+  // It previously only won when it agreed with the API to within 90s, which inverted the
+  // priority exactly when it mattered: once a poll failed, the API countdown ran down to
+  // 00:00, the sidebar's real 4:00 was then >90s away, and the correct number on the page
+  // got rejected as implausible.
+  function syncChainFromSidebar() {
+    if (!state.chain?.active) {
+      clearChainEstimate();
+      return null;
+    }
+    // Hits first: a reset invalidates the collected bounds, so it must be applied before
+    // this tick's timer reading is folded in.
+    noteChainHits(currentHitsBest());
+    const dom = readSidebarChainSeconds();
+    if (dom != null) {
+      state.chain.timeout = dom;
+      state.chain.fetchedAt = Date.now();
+      state.sidebarSyncedAt = Date.now();
+      noteChainTimer(dom); // exact — keeps the estimate right if the bar later disappears
+    }
+    // The hit count is handled differently on purpose. The timer is safe to adopt outright
+    // because it's a pure countdown, but Torn's own bar may refresh more lazily than our
+    // 3s API poll — adopting its hits unconditionally could drag a FRESH count backwards.
+    // So it's only used to repair a snapshot we already know is stale, which is exactly
+    // the case that matters (and the only chain truth mobile/PDA can offer at all).
+    if (chainStaleness().stale) {
+      const hits = readSidebarChainHits();
+      if (hits != null && hits !== state.chain.current) {
+        state.chain.current = hits;
+        state.sidebarHitsSyncedAt = Date.now();
+      }
+    }
+    return dom;
+  }
+
+  // True while Torn's own chain bar is supplying the hit count (stale-API repair above).
+  function sidebarHitsLive() {
+    return state.sidebarHitsSyncedAt != null && Date.now() - state.sidebarHitsSyncedAt < 15000;
+  }
+
+  // True while Torn's own chain bar is feeding us a live countdown. When it is, the drop
+  // timer is trustworthy even if the API snapshot behind the hit count has gone stale.
+  function sidebarTimerLive() {
+    return state.sidebarSyncedAt != null && Date.now() - state.sidebarSyncedAt < 5000;
+  }
+
+  // Torn doesn't call it a chain until 10 hits land inside the timer — below that you're in
+  // CHAIN WARM-UP, which the bar's own tooltip spells out: "Make 9 more hits within 00:17
+  // to start a chain". The API reports current/timeout during warm-up exactly as it does
+  // mid-chain, so the panel was badging it LIVE and calling the countdown a "drop timer" —
+  // wrong on both counts, and precisely the kind of status mismatch members were reporting.
+  // The hit-or-lose-it urgency is identical, so alarms and the countdown stay on as they
+  // are; only the labelling changes to match what Torn is actually showing.
+  const CHAIN_WARMUP_HITS = 10;
+  function chainWarmup() {
+    return Boolean(state.chain?.active) && state.chain.current < CHAIN_WARMUP_HITS;
+  }
+
+  // The hit count we trust most right now: the API's, or Torn's own bar if it's further
+  // along (mobile/PDA has the bar but no countdown). Monotonic within a chain run, which is
+  // what lets a change in it stand in for "a hit landed".
+  function currentHitsBest() {
+    const api = state.chain?.current ?? 0;
+    const dom = readSidebarChainHits();
+    return dom != null && dom > api ? dom : api;
+  }
+
+  // A landed hit resets Torn's timer, so every bound we'd collected describes a run that no
+  // longer exists. Hit count moving is the unambiguous signal for that — and on mobile the
+  // chain bar supplies it every second for free, so PDA detects the reset promptly even
+  // while the API poll is easing off.
+  function noteChainHits(hits) {
+    if (!Number.isFinite(hits)) return;
+    if (hits !== state.chainRunHits) {
+      state.chainRunHits = hits;
+      state.chainDeadline = null;
+    }
+  }
+
+  // Torn caches /faction/chain, so a response's `timeout` may be several seconds old — and
+  // a stale value always OVERSTATES the time left, which is the dangerous direction for a
+  // drop alarm. Each observation is therefore an UPPER BOUND on the true deadline, and the
+  // tightest bound is the best estimate: keep the MINIMUM across the run. Repeated cached
+  // responses are self-cancelling (the same `timeout` read 3s later implies a deadline 3s
+  // further out, so the minimum ignores it) and the estimate can never regress.
+  //
+  // What this does NOT do is beat the poll rate. Simulated against a 30s cache on every
+  // phase alignment, the freshest reading available in a cycle is stale by up to just under
+  // one poll interval — ~2.8s at a 3s poll, ~9.8s at 10s — and no estimator can recover
+  // what was never fetched. That bound, not the estimator, is why the poll cadence has to
+  // step up before the timer gets anywhere near an alarm threshold (RELAXED_ABOVE_SEC).
+  function noteChainTimer(remainingSec) {
+    if (!Number.isFinite(remainingSec) || remainingSec <= 0) return;
+    const observed = Date.now() + remainingSec * 1000;
+    if (state.chainDeadline == null || observed < state.chainDeadline) {
+      state.chainDeadline = observed;
+    }
+  }
+
+  function clearChainEstimate() {
+    state.chainDeadline = null;
+    state.chainRunHits = null;
+  }
+
   function chainRemaining() {
     if (!state.chain?.active) return 0;
-    const byTimeout = Math.max(0, state.chain.timeout - Math.floor((Date.now() - state.chain.fetchedAt) / 1000));
-    // Prefer the sidebar's live value when it's plausibly the chain timer (within ~90s of
-    // our API value) — a mis-parsed element can't hijack the countdown that way.
+    // Torn's own bar is exact when we can read it (it's the number the player sees).
     const dom = readSidebarChainSeconds();
-    if (dom != null && Math.abs(dom - byTimeout) <= 90) return dom;
-    return byTimeout;
+    if (dom != null) return dom;
+    // Torn's absolute drop instant, converted to this member's clock. Nothing here decays
+    // between polls — it is a fixed point that only moves when a hit pushes it out — so
+    // this is the countdown on PDA, where there is no chain bar to read.
+    if (state.chain.deadlineLocalMs != null) {
+      return Math.max(0, Math.round((state.chain.deadlineLocalMs - Date.now()) / 1000));
+    }
+    if (state.chainDeadline != null) {
+      return Math.max(0, Math.round((state.chainDeadline - Date.now()) / 1000));
+    }
+    return Math.max(0, state.chain.timeout - Math.floor((Date.now() - state.chain.fetchedAt) / 1000));
   }
 
   function duration(seconds) {
@@ -1126,9 +1746,21 @@
     return "bad";
   }
 
+  // The "Current watcher" / "Next watcher" cards. This must read BOTH payload shapes:
+  // refreshAll nulls state.watch in token mode, so reading only state.watch.shifts left
+  // every link-mode viewer looking at "No watcher assigned" on a fully staffed sheet —
+  // the other half of why clearing the link "fixed" the panel.
   function currentAndNextShift() {
-    const shifts = state.watch?.shifts || [];
     const now = Date.now();
+    const shifts = Array.isArray(state.watch?.shifts)
+      ? state.watch.shifts
+      : (Array.isArray(state.signup?.shifts) ? state.signup.shifts : []).map((s) => ({
+          shift_start: s.shift_start,
+          shift_end: s.shift_end,
+          watcher_id: s.main?.watcher_id,
+          watcher_name: s.main?.watcher_name,
+          watcher_online_status: s.main?.online_status,
+        }));
     const current = shifts.find((s) => new Date(s.shift_start).getTime() <= now && new Date(s.shift_end).getTime() > now) || null;
     const next = shifts.find((s) => new Date(s.shift_start).getTime() > now) || null;
     return { current, next };
@@ -1207,9 +1839,32 @@
     // The shift that covers the instant this one ends (the contiguous next slot). If
     // nothing covers it, there's an immediate unmanned gap right after the handoff.
     const cover = rows.find((s) => new Date(s.start).getTime() <= handoffAt && new Date(s.end).getTime() > handoffAt) || null;
-    if (!cover || cover.id == null) return { state: "gap", endsIn, name: null, online: null };
-    const online = cover.online === "Online";
-    return { state: online ? "ready" : "risk", endsIn, name: cover.name, online: cover.online };
+    // A missing assignment is a fact about the sheet, so it stands even on old data.
+    if (!cover || cover.id == null) return { state: "gap", endsIn, name: null, online: null, stale: false };
+    // Whether they're ONLINE is not. That comes from the throttled schedule poll, and
+    // claiming "the next watcher isn't online" off a two-minute-old roster is how a panel
+    // ends up waking someone to chase a watcher who has been at their desk the whole time.
+    // Say we don't know instead — the handoff is still flagged, just without the false claim.
+    // A NAME is stable, so resolving it from any roster we have is always fine. ONLINE
+    // STATUS is not — it changes by the minute, and this decides whether to wake someone.
+    // So each source only counts while it's actually fresh: the payload's until the
+    // schedule goes stale, ours until the same age. Our roster refreshes on the slow
+    // ROSTER_MIN_INTERVAL, so it will often be too old to vouch for a status even though
+    // its names remain perfectly good — which is the honest split.
+    const name = rosterName(cover.id, cover.name || `ID ${cover.id}`);
+    const payloadStatus = scheduleStale() ? null : (cover.online ?? null);
+    const rosterFresh = lastRosterAt > 0 && Date.now() - lastRosterAt <= SCHEDULE_STALE_MS;
+    const ownStatus = rosterFresh ? (state.tornRoster?.[cover.id]?.status ?? null) : null;
+    const status = payloadStatus ?? ownStatus;
+    if (status == null) return { state: "unknown", endsIn, id: cover.id, name, online: null, stale: true };
+    return { state: status === "Online" ? "ready" : "risk", endsIn, id: cover.id, name, online: status, stale: false };
+  }
+
+  // True when the schedule payload (shifts + roster + online status) is old enough that
+  // its online flags shouldn't be treated as current.
+  function scheduleStale() {
+    if (state.scheduleConfirmedAt == null) return true;
+    return Date.now() - state.scheduleConfirmedAt > SCHEDULE_STALE_MS;
   }
 
   // "~Xm" ETA to close a gap of `toGo` hits at `pacePerMin`. Empty when unknown.
@@ -1401,7 +2056,21 @@
     const active = Boolean(state.chain?.active);
     const cur = state.chain?.current || 0;
 
-    if (active && !state.wasChainActive) {
+    // A DIFFERENT chain run, identified by Torn's own chain id. This catches the case the
+    // active/!wasChainActive edge cannot: one chain ending and the next starting between
+    // two polls (easy on the relaxed cadence, or across a backgrounded tab), where we
+    // never observe active=false and would otherwise carry the previous chain's peak,
+    // your-hits and bonus tracking straight into the new one — and merge them into its
+    // "chain ended" recap. id is 0 when Torn omits it, in which case nothing changes.
+    const id = state.chain?.id || 0;
+    const newRun = active && id > 0 && state.lastChainId != null && id !== state.lastChainId;
+    if (active) state.lastChainId = id;
+
+    // No recap is carried across a newRun on purpose: reaching this branch means we never
+    // saw the previous chain end, so its totals are partial by definition and a "chain
+    // ended: 40 hits" card built from them would understate a chain we simply missed.
+    if (newRun) clearChainEstimate();
+    if ((active && !state.wasChainActive) || newRun) {
       // A fresh chain started — reset the per-chain accumulators.
       state.chainYourHits = 0;
       state.chainYourRespect = 0;
@@ -1459,6 +2128,19 @@
     }
 
     state.wasChainActive = active;
+    pruneFiredShift();
+  }
+
+  // firedShift keys are `<shift ISO start>:<kind>` and were never removed, so a long-lived
+  // tab across many chains accumulated them without bound. Shifts that finished a day ago
+  // can never fire again, so drop them. Cheap, and only walks the set once it's large.
+  function pruneFiredShift() {
+    if (state.firedShift.size < 64) return;
+    const cutoff = Date.now() - 86400000;
+    for (const key of state.firedShift) {
+      const at = new Date(key.slice(0, key.lastIndexOf(":"))).getTime();
+      if (Number.isFinite(at) && at < cutoff) state.firedShift.delete(key);
+    }
   }
 
   // Runs every second (even while collapsed/hidden — the whole point is to alert you
@@ -1467,7 +2149,17 @@
   function evaluateAlarms() {
     if (!state.alarm) return;
 
-    if (state.chain?.active) {
+    if (state.chain?.active && chainStaleness().stale && !sidebarTimerLive()) {
+      // The countdown is running off a snapshot nothing has confirmed in a while, so a
+      // "drops in 10s" alarm here would be a guess. Say the true thing once instead —
+      // a wrong drop alarm is worse than none, because watchers stop trusting the alarm.
+      // Exempt when torn.com's own chain bar is feeding us the countdown: the API being
+      // stale doesn't make the timer wrong, and that's when the alarm matters most.
+      if (!state.firedDrop.has("stale")) {
+        state.firedDrop.add("stale");
+        fireAlarm("drop", "Chain data went stale — check the chain on Torn.");
+      }
+    } else if (state.chain?.active) {
       const remaining = chainRemaining();
       // A fresh hit reset the timer upward → re-arm the thresholds for this run.
       if (state.lastRemaining != null && remaining > state.lastRemaining + 3) state.firedDrop.clear();
@@ -1475,7 +2167,9 @@
       for (const t of effThresholds()) {
         if (remaining > 0 && remaining <= t && !state.firedDrop.has(t)) {
           state.firedDrop.add(t);
-          fireAlarm("drop", `Chain drops in ${remaining}s — HIT NOW!`);
+          fireAlarm("drop", chainWarmup()
+            ? `Warm-up ends in ${remaining}s — ${CHAIN_WARMUP_HITS - state.chain.current} more to start the chain!`
+            : `Chain drops in ${remaining}s — HIT NOW!`);
           break; // one alert per tick
         }
       }
@@ -1521,6 +2215,30 @@
   }
 
   // Drop-timer urgency: green while comfortable, amber approaching, red (pulsing) close.
+  // Plain-language account of where the countdown is coming from and whether it's exact.
+  // Deliberately visible (the TORN LIVE tooltip) so this is verifiable in the field rather
+  // than something we assume: if Torn stops sending a header, it says so instead of
+  // silently degrading to a bounded guess.
+  function timerSourceLabel() {
+    if (sidebarTimerLive()) return "Exact — read from Torn's own chain bar on this page.";
+    const src = state.chain?.timeSource;
+    const stale = state.chain?.staleSec;
+    if (src === "chain.end") {
+      const off = serverClockOffsetSec();
+      const skew = off == null ? "" : ` Your clock differs from Torn's by ${off >= 0 ? "+" : ""}${off.toFixed(1)}s, corrected for.`;
+      const age = Math.round(stale || 0);
+      return `Exact — counting down to Torn's absolute drop time (chain.end).`
+        + `${age > 1 ? ` That response was ${age}s old.` : " The endpoint answered live (no cache lag)."}${skew}`;
+    }
+    if (src === "age") {
+      return `Exact — corrected with the response's Age header (was ${Math.round(stale || 0)}s cached).`;
+    }
+    if (src === "date") {
+      return `Corrected to ~1s using the response Date header (was ~${Math.round(stale || 0)}s cached).`;
+    }
+    return "Approximate — Torn sent no freshness header, so the countdown is bounded by the poll interval, not exact.";
+  }
+
   function timerUrgencyClass(remaining) {
     if (remaining <= 0) return "";
     if (remaining <= 30) return "u-bad";
@@ -1601,15 +2319,30 @@
       .tocw-when-zone { font-weight: 400; font-size: 10px; color: #7385a0; }
       /* Main + backup stack vertically, each its own clear line (role · who · action) */
       .tocw-slots { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
-      .tocw-slot { display: flex; align-items: center; gap: 8px; }
+      /* A slot is role · who · actions on one line. The actions were flex-shrink:0 while
+         the name had min-width:0, so at phone widths the three buttons took everything and
+         the name collapsed to a few pixels and spilled underneath them — the overlap in the
+         PDA screenshot. Giving the name a real minimum makes the ACTIONS wrap to their own
+         line instead, which is the right thing to give up first. */
+      .tocw-slot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; row-gap: 6px; }
       .tocw-slot__role { min-width: 52px; font-weight: 700; color: #9eb4ce; }
       .tocw-slot--backup .tocw-slot__role { color: #7f93ad; }
-      .tocw-slot__who { flex: 1; min-width: 0; }
-      .tocw-slot__actions { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; flex-shrink: 0; }
+      .tocw-slot__who { flex: 1 1 120px; min-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tocw-slot__actions { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; flex-shrink: 0; margin-left: auto; }
+      /* Member names link to their Torn profile. Explicit colors so torn.com's own anchor
+         styles can't bleed in and turn them unreadable inside the panel. */
+      .tocw-who { color: #eaf3ff; text-decoration: none; border-bottom: 1px dotted #5b708a; }
+      .tocw-who:hover { color: #fff; border-bottom-color: #9eb4ce; }
       .tocw-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 5px; background: #789; }
       .tocw-dot.ok { background: #32d47b; }
       .tocw-dot.warn { background: #f2b13c; }
       .tocw-dot.bad { background: #ff5d67; }
+      /* Roster picker for assigning a slot. Scrolls inside its own box so a 100-member
+         faction can't push the buttons below it off the panel. */
+      .tocw-picker { max-height: 210px; overflow-y: auto; -webkit-overflow-scrolling: touch; border: 1px solid #2b3d52; border-radius: 7px; padding: 4px; }
+      .tocw-pick { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: transparent; border: 0; border-radius: 6px; padding: 8px; font-weight: 600; }
+      .tocw-pick:hover { background: #17263a; }
+      .tocw-pick__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .tocw-alert { padding: 8px 9px; border-radius: 7px; background: #21180b; border: 1px solid #67420c; color: #ffdca1; }
       .tocw-alert.bad { background: #231016; border-color: #651922; color: #ffc6cc; }
       .tocw-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
@@ -1691,6 +2424,16 @@
         .tocw-settings .grid { grid-template-columns: 1fr; }
         .tocw-big { font-size: 30px; }
         .tocw-focus-timer { font-size: 64px; }
+        /* Reclaim the fixed 108px time column: at phone widths it is a third of the row,
+           and the shift window reads fine as a heading above the slots. */
+        .tocw-row { grid-template-columns: 1fr; gap: 8px; padding: 12px 10px; }
+        .tocw-when-tct, .tocw-when-local { display: inline; }
+        .tocw-when-local { margin-left: 10px; }
+        /* The coloured dot already encodes online status; the word beside it just competed
+           with the name for space. Keep it on desktop, drop it here (the dot carries a
+           title with the full status). */
+        .tocw-slot__who .tocw-slot__status { display: none; }
+        .tocw-slot__actions button.small { padding: 7px 9px; font-size: 12px; }
       }
     `;
       document.head.appendChild(style);
@@ -1785,10 +2528,22 @@
   }
 
   let lastRenderView = null;
-  function render() {
+  // The notice currently on screen and when it first appeared (see NOTICE_TTL_MS).
+  let shownNotice = null;
+  let shownNoticeAt = 0;
+  // opts.background marks a render driven by the data loop (or a spinner) rather than by
+  // a direct interaction with what's on screen.
+  function render(opts = {}) {
     createShell();
     const box = document.getElementById("tocw");
     if (!box) return;
+    // Settings is a FORM, and a poll rebuilding it mid-edit wipes whatever is half-typed,
+    // snaps <details> shut and drops the caret — every few seconds. Preserving focus (as a
+    // previous pass did) wasn't enough, because each input re-renders its value from
+    // storage, so the in-progress text goes with it. The settings view shows no live data,
+    // so a poll has nothing to contribute: skip it entirely and let the member's own
+    // interactions drive the rebuild.
+    if (state.settingsOpen && opts.background) return;
     // Fully hidden: leave only the floating "TO" launcher (tap it to bring the
     // panel back). Cheap early-out so the 1s render tick does no work while hidden.
     const launcher = document.getElementById("tocw-launcher");
@@ -1817,11 +2572,36 @@
     const savedScroll = prevBody && viewKind === lastRenderView ? prevBody.scrollTop : 0;
     lastRenderView = viewKind;
 
+    // Preserve focus and caret across the rebuild too. Without this a background poll
+    // yanks the cursor out of whatever field is being typed in — which the inline schedule
+    // form made unmissable, but which applied to every Settings input already.
+    const activeEl = document.activeElement;
+    const focusId = activeEl && activeEl.id && box.contains(activeEl) ? activeEl.id : null;
+    let selStart = null;
+    let selEnd = null;
+    if (focusId) {
+      // Reading selectionStart throws on some input types (number/range) — not fatal.
+      try { selStart = activeEl.selectionStart; selEnd = activeEl.selectionEnd; } catch { /* no caret */ }
+    }
+
     const cfg = settings();
     const event = state.watch?.event || state.signup?.event || null;
     const mode = panelMode();
     const chain = state.chain;
     const live = Boolean(chain?.active);
+    const { stale } = chainStaleness();
+    const warmup = chainWarmup();
+
+    // Age the notice out. Stamping it here (rather than at each of the ~25 assignment
+    // sites) means any code path that sets a notice gets the expiry for free.
+    if (state.notice !== shownNotice) {
+      shownNotice = state.notice;
+      shownNoticeAt = Date.now();
+    }
+    if (state.notice && Date.now() - shownNoticeAt > NOTICE_TTL_MS) {
+      state.notice = null;
+      shownNotice = null;
+    }
     const currentHits = chain?.current || 0;
     const remaining = chainRemaining();
     const bonus = nextBonus(currentHits);
@@ -1843,12 +2623,16 @@
     box.innerHTML = `
       <div class="tocw-head" id="tocw-drag-handle" title="Drag to move Chain Watch">
         <div class="tocw-pills">
-          <span class="tocw-pill ${live ? "ok" : "warn"}">${live ? "LIVE" : "SCHEDULED"}</span>
-          ${state.liveSource === "torn"
-            ? `<span class="tocw-pill ok" title="Chain data is pulled straight from Torn — no backend lag">TORN LIVE</span>`
-            : state.liveSource === "cache"
-              ? `<span class="tocw-pill warn" title="Falling back to the Overseer cache (add a Torn API key with faction access for zero-lag data)">CACHED</span>`
-              : `<span class="tocw-pill">SITE SYNC</span>`}
+          <span class="tocw-pill ${warmup ? "warn" : live && !stale ? "ok" : "warn"}" ${warmup ? `title="Chain warm-up — ${CHAIN_WARMUP_HITS} hits are needed inside the timer before this counts as a chain"` : ""}>${warmup ? "WARM-UP" : live ? "LIVE" : "SCHEDULED"}</span>
+          ${stale
+            ? `<span class="tocw-pill bad" title="The chain snapshot hasn't been confirmed recently — these numbers may not match Torn">STALE</span>`
+            : needsKey()
+              ? `<span class="tocw-pill warn" title="No Torn API key set — the chain HUD, names and signups all need one">NO KEY</span>`
+              : state.liveSource === "torn"
+                ? `<span class="tocw-pill ok" title="${escapeHtml(timerSourceLabel())}">TORN LIVE</span>`
+                : state.liveSource === "cache"
+                  ? `<span class="tocw-pill warn" title="Your own Torn read failed, so this is the Overseer cache — it lags and can't resolve names. A fallback, not a mode.">CACHED</span>`
+                  : `<span class="tocw-pill" title="Waiting on the first successful read">SITE SYNC</span>`}
           <span class="tocw-pill">READ-ONLY</span>
         </div>
         <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
@@ -1856,7 +2640,7 @@
             <div class="tocw-title">Chain Watch</div>
             <div class="tocw-muted tocw-subtitle">v${VERSION} - ${event ? escapeHtml(event.title) : "No chain scheduled"}</div>
             <div class="tocw-cstatus">${live
-              ? `<span class="tocw-cstatus-timer ${timerUrgencyClass(remaining)}" id="tocw-ctimer">${duration(remaining)}</span> <span class="tocw-muted">· ${chain.current} hit${chain.current === 1 ? "" : "s"}</span>`
+              ? `<span class="tocw-cstatus-timer ${timerUrgencyClass(remaining)}" id="tocw-ctimer">${duration(remaining)}</span> <span class="tocw-muted">· ${chain.current} hit${chain.current === 1 ? "" : "s"}${stale ? " · stale" : ""}</span>`
               : event
                 ? `<span class="tocw-muted">Starts in ${duration(scheduledSeconds)}</span>`
                 : `<span class="tocw-muted">No chain scheduled</span>`}</div>
@@ -1874,19 +2658,26 @@
         ${state.notice ? `<div class="tocw-alert">${escapeHtml(state.notice)}</div>` : ""}
         ${state.settingsOpen ? renderSettingsBody() : state.focus ? renderFocus(chain, remaining, live, event, scheduledSeconds) : `
         ${versionAlert}
-        ${mode === "token"
-          ? (state.signup?.needs_verification
-              ? `<div class="tocw-alert">This chain sheet is faction-only. Add your Torn API key in Settings to verify and view it.</div>`
-              : `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""} — verified with your key.</div>`)
-          : mode === "none"
-            ? `<div class="tocw-alert">Add your Torn API key in Settings and connect the site session — or paste a chain-watch signup link there.</div>`
+        ${needsKey()
+          ? renderKeyGate()
+          : mode === "token"
+            ? (state.signup?.needs_verification
+                ? `<div class="tocw-alert">Verifying you against Torn — if this persists, your key may not have faction access.</div>`
+                : `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""} — verified with your key.</div>`)
             : !cfg.sessionToken
-              ? `<div class="tocw-alert">Connect the site session in Settings to load the schedule.</div>`
+              ? (connectError
+                  ? `<div class="tocw-alert bad">Your key was rejected by the Overseer site: ${escapeHtml(connectError)}
+                      <button id="tocw-connect-retry" class="small" style="margin-top:6px;">Try again</button></div>`
+                  : `<div class="tocw-alert">Verifying your key with the Overseer site…</div>`)
               : ""}
+        ${renderStaleLink()}
+        ${renderChainStale()}
         ${renderAccessHint()}
         ${renderChainSummary()}
         ${renderWatchBanner()}
         ${renderCoverage()}
+        ${renderScheduleForm()}
+        ${renderSlotActionForm()}
         ${live ? renderLive(chain, remaining, bonus, bonusPct, current, next) : renderScheduled(event, scheduledSeconds)}
         ${renderShifts()}
         ${renderAbsence()}
@@ -1905,6 +2696,15 @@
     if (savedScroll > 0) {
       const newBody = box.querySelector(".tocw-body");
       if (newBody) newBody.scrollTop = savedScroll;
+    }
+    if (focusId) {
+      const again = document.getElementById(focusId);
+      if (again) {
+        again.focus();
+        if (selStart != null) {
+          try { again.setSelectionRange(selStart, selEnd); } catch { /* no caret to restore */ }
+        }
+      }
     }
 
     document.getElementById("tocw-focus")?.addEventListener("click", () => {
@@ -1935,6 +2735,33 @@
       render();
     });
     document.getElementById("tocw-refresh")?.addEventListener("click", () => void refreshAll(true));
+    document.getElementById("tocw-force-refresh")?.addEventListener("click", () => {
+      state.tornFailCount = 0; // a manual retry clears the backoff
+      void refreshAll(true);
+    });
+    document.getElementById("tocw-link-clear")?.addEventListener("click", () => clearSignupLink());
+    document.getElementById("tocw-slot-cancel")?.addEventListener("click", () => closeSlotAction());
+    document.getElementById("tocw-slot-confirm")?.addEventListener("click", () => void submitSlotAction());
+    document.getElementById("tocw-slot-search")?.addEventListener("input", (e) => {
+      // Re-render to refilter, keeping the caret (render() restores focus + selection).
+      if (state.slotAction) state.slotAction.query = String(e.target.value);
+      render();
+    });
+    for (const pick of box.querySelectorAll("[data-tocw-pick]")) {
+      pick.addEventListener("click", () => void submitSlotAction(pick.getAttribute("data-tocw-pick")));
+    }
+    document.getElementById("tocw-sched-save")?.addEventListener("click", () => void submitScheduleForm());
+    document.getElementById("tocw-sched-cancel")?.addEventListener("click", () => {
+      captureScheduleForm(); // keep the draft text in case they reopen it
+      state.scheduleOpen = false;
+      state.scheduleForm.error = null;
+      render();
+    });
+    // Mirror typing into state on the way out of each field, so the next poll's re-render
+    // restores it rather than blanking the form mid-entry.
+    for (const id of ["tocw-sched-title", "tocw-sched-start", "tocw-sched-hours"]) {
+      document.getElementById(id)?.addEventListener("input", captureScheduleForm);
+    }
     document.getElementById("tocw-copy")?.addEventListener("click", () => void copySummary());
     document.getElementById("tocw-summary-dismiss")?.addEventListener("click", () => {
       state.chainSummary = null;
@@ -1943,6 +2770,23 @@
     document.getElementById("tocw-settings")?.addEventListener("click", () => {
       state.settingsOpen = true;
       render();
+    });
+    document.getElementById("tocw-connect-retry")?.addEventListener("click", () => {
+      retryConnectNow();
+      void refreshAll(true);
+    });
+    document.getElementById("tocw-key-setup")?.addEventListener("click", () => {
+      // Open Settings with Connection & setup already expanded and the key field focused —
+      // otherwise "Open Settings" drops you at the top of a long form with the one field
+      // you need collapsed out of sight at the bottom.
+      state.settingsOpen = true;
+      state.settingsExpandConnection = true;
+      render();
+      const key = document.getElementById("tocw-set-torn-key");
+      if (key) {
+        key.focus();
+        key.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
     });
     document.getElementById("tocw-hit-setup")?.addEventListener("click", () => {
       state.settingsOpen = true;
@@ -2011,10 +2855,24 @@
     return { out: Boolean(mine), reason: mine?.reason ?? null };
   }
 
-  function absentNames() {
-    if (panelMode() === "token") return (state.signup?.absent || []).map((a) => a.name);
+  // Who's out, as {id, name} — the id is what lets the name be resolved and linked. It was
+  // being dropped here, which is why this list alone kept showing raw "ID 12345" even once
+  // the rest of the panel had names.
+  // Keyed off WHICH PAYLOAD is loaded rather than off panelMode, matching normalizedShifts
+  // and coverageGaps. Mode and payload can briefly disagree (refreshAll nulls the inactive
+  // one), and the payload is the thing actually being rendered.
+  function absentMembers() {
+    if (Array.isArray(state.signup?.absent)) {
+      return state.signup.absent.map((a) => ({
+        id: num(a?.id ?? a?.player_id),
+        name: a?.name ?? a?.player_name ?? null,
+      }));
+    }
     const rows = Array.isArray(state.watch?.absences) ? state.watch.absences : [];
-    return rows.filter((a) => !a.cleared_at).map((a) => a.player_name);
+    return rows.filter((a) => !a.cleared_at).map((a) => ({
+      id: num(a?.player_id),
+      name: a?.player_name ?? null,
+    }));
   }
 
   function renderAbsence() {
@@ -2026,9 +2884,11 @@
     const readOnly = mode === "token" ? Boolean(event.read_only) : watchEventReadOnly(event);
     if (readOnly) return "";
     const { out, reason } = myAbsenceInfo();
-    const others = absentNames();
+    const others = absentMembers();
     const othersLine = others.length
-      ? `<div class="tocw-muted" style="margin-top:6px;">Out this chain (${others.length}): ${escapeHtml(others.join(", "))}</div>`
+      ? `<div class="tocw-muted" style="margin-top:6px;">Out this chain (${others.length}): ${
+          others.map((a) => profileLink(a.id, rosterName(a.id, a.name || `ID ${a.id ?? "?"}`))).join(", ")
+        }</div>`
       : "";
     const control = out
       ? `<div class="tocw-watch-banner soon"><span>🚫 You're out for this chain${reason ? ` — "${escapeHtml(reason)}"` : ""}</span><button class="small" id="tocw-absence-in">I'm back in</button></div>`
@@ -2128,11 +2988,105 @@
     `;
   }
 
-  // When we hold a key but the direct chain read keeps failing (stuck on CACHED), the
-  // most likely cause is the key lacking faction API access — say so, don't stay silent.
+  // A pasted signup link pins the panel to ONE event forever — panelMode() stays "token"
+  // for as long as the token is stored, so a link minted for last week's chain keeps
+  // showing that sheet while the faction runs a new one. That's why "clear the link in
+  // Settings" became the standing workaround; surface it in the panel instead, one click,
+  // where the member actually notices the mismatch.
+  function signupLinkExpired() {
+    if (panelMode() !== "token") return false;
+    const event = state.signup?.event;
+    if (!event) return false;
+    // "frozen" is the finalized-archive phase renderSignupShifts already keys off; read_only
+    // is the flag renderAbsence uses. Either means this sheet can no longer be the live one.
+    if (event.read_only || event.phase === "frozen") return true;
+    const shifts = Array.isArray(state.signup?.shifts) ? state.signup.shifts : [];
+    if (!shifts.length) return false;
+    const lastEnd = shifts.reduce((max, s) => Math.max(max, new Date(s.shift_end).getTime() || 0), 0);
+    // An hour's grace so a chain running past its last scheduled slot isn't declared over.
+    return lastEnd > 0 && Date.now() - lastEnd > 3600000;
+  }
+
+  function renderStaleLink() {
+    if (!signupLinkExpired()) return "";
+    const title = state.signup?.event?.title;
+    return `<div class="tocw-alert bad">This signup link is for a finished chain${title ? ` (${escapeHtml(title)})` : ""}, so the shifts below are last chain's — not your faction's current one.
+      <button id="tocw-link-clear" class="small" style="margin-top:6px;">Switch to my faction's current chain</button></div>`;
+  }
+
+  // Drop the pinned signup link and fall back to session mode (the faction's live event).
+  function clearSignupLink(notice) {
+    gmSet(STORE.signupToken, "");
+    state.signup = null;
+    state.notice = notice || "Signup link cleared — showing your faction's current chain.";
+    void refreshAll(true);
+  }
+
+  // The panel's honesty valve: when the chain snapshot hasn't been confirmed recently,
+  // say so plainly instead of letting a frozen hit count sit under a LIVE badge. This is
+  // the state members were hitting and describing as "the panel desynced from the chain".
+  function renderChainStale() {
+    const { ageMs, stale } = chainStaleness();
+    if (!stale) return "";
+    const secs = Math.round(ageMs / 1000);
+    const how = secs >= 120 ? `${Math.round(secs / 60)}m` : `${secs}s`;
+    // Name only what's actually suspect. Desktop keeps a true drop timer off Torn's chain
+    // bar; mobile/PDA keeps a true hit count off the same bar (it has no countdown). Telling
+    // a watcher their timer is unreliable when it isn't is its own kind of desync.
+    const timerOk = sidebarTimerLive();
+    const hitsOk = sidebarHitsLive();
+    const what = timerOk && hitsOk
+      ? "some details below may lag (hits and drop timer are being read from Torn's own chain bar)"
+      : timerOk
+        ? "the hit count below may not match Torn (the drop timer is being read from Torn's own chain bar)"
+        : hitsOk
+          ? "the drop timer below may not match Torn (the hit count is being read from Torn's own chain bar)"
+          : "the hits and drop timer below may not match Torn";
+    const why = state.rateLimited
+      ? "Torn is rate-limiting your account (error 5). The 100 requests/minute limit is per account, not per key, so it's shared with every other Torn script you run — a second key won't help. Close spare torn.com windows or pause another script; the panel is backing off and will recover on its own."
+      : state.chainStaleError?.message
+        ? escapeHtml(state.chainStaleError.message)
+        : "The live chain read isn't coming back.";
+    return `<div class="tocw-alert bad">Chain data is <strong>${how} old</strong> — ${what}. ${why}
+      <button id="tocw-force-refresh" class="small" style="margin-top:6px;">Retry now</button></div>`;
+  }
+
+  // Every path into this panel needs a Torn key, and has done since verify-to-view landed
+  // server-side: chain-signup answers a keyless caller with only { needs_verification: true }
+  // — no sheet, no roster, no live data — and a site session can only be minted FROM a key.
+  // The panel used to imply otherwise ("…or paste a chain-watch signup link there") and to
+  // badge itself CACHED / SITE SYNC as though a keyless mode worked. Those backend blocks
+  // are real, but they are a FALLBACK for when your own Torn call fails, not a way in.
+  function needsKey() {
+    return !settings().tornKey;
+  }
+
+  function renderKeyGate() {
+    if (!needsKey()) return "";
+    const hasLink = Boolean(settings().signupToken);
+    return `
+      <div class="tocw-card" style="border-color:#67420c;">
+        <div class="tocw-card-title">⚙️ Add your Torn API key to start</div>
+        <div class="tocw-muted">
+          Chain Watch reads the live chain, hit count, watcher names and online status straight
+          from Torn with your own key — that's what makes the drop timer match the game. The key
+          also proves you're in the faction, which the chain sheet requires before it will show
+          any shifts at all${hasLink ? " (your signup link is saved and opens as soon as the key is in)" : ""}.
+        </div>
+        <div class="tocw-muted" style="margin-top:6px;">
+          A <strong>Limited-access</strong> key with faction access is enough. It's stored only in
+          your userscript manager — the Overseer backend never keeps a copy.
+        </div>
+        <button id="tocw-key-setup" class="small" style="margin-top:8px;">Open Settings</button>
+      </div>
+    `;
+  }
+
+  // A key that EXISTS but can't read the faction is the realistic failure now that a key is
+  // required — it's the difference between "you're not set up" and "you're set up wrong".
   function renderAccessHint() {
-    if (settings().tornKey && state.tornFailCount >= 3 && state.liveSource !== "torn") {
-      return `<div class="tocw-alert">Your Torn key isn't returning live chain data — it likely needs <strong>faction API access</strong>. Ask leadership to enable it for you to get zero-lag hits.</div>`;
+    if (!needsKey() && state.tornFailCount >= 3 && state.liveSource !== "torn") {
+      return `<div class="tocw-alert">Your Torn key isn't returning live chain data — it likely needs <strong>faction API access</strong>. Ask leadership to enable it; until then the panel falls back to the Overseer cache, which lags and can't resolve names.</div>`;
     }
     return "";
   }
@@ -2174,7 +3128,9 @@
     const cur = chain?.current || 0;
     const you = state.attacks?.pace?.you;
     const timerText = live ? duration(remaining) : (event ? `Starts in ${duration(scheduledSeconds)}` : "--");
-    const label = live ? "Drop timer" : (event ? "Next chain" : "No chain scheduled");
+    const label = live
+      ? (chainWarmup() ? `Warm-up — ${CHAIN_WARMUP_HITS - cur} more to start` : "Drop timer")
+      : (event ? "Next chain" : "No chain scheduled");
     return `
       ${renderWatchBanner()}
       ${renderHandoff()}
@@ -2217,9 +3173,12 @@
       return `<div class="tocw-alert bad">🚨 Handoff gap — no watcher after this shift (ends in ${duration(h.endsIn)}). Get it covered.</div>`;
     }
     if (h.state === "risk") {
-      return `<div class="tocw-alert bad">🚨 Next watcher ${escapeHtml(h.name || "")} is ${escapeHtml(h.online || "not online")} — ping them (handoff in ${duration(h.endsIn)}).</div>`;
+      return `<div class="tocw-alert bad">🚨 Next watcher ${profileLink(h.id, h.name || "")} is ${escapeHtml(h.online || "not online")} — ping them (handoff in ${duration(h.endsIn)}).</div>`;
     }
-    return `<div class="tocw-watch-banner on">✅ Handoff ready — ${escapeHtml(h.name || "")} is online (in ${duration(h.endsIn)})</div>`;
+    if (h.state === "unknown") {
+      return `<div class="tocw-alert">⏱️ Handoff in ${duration(h.endsIn)} — ${profileLink(h.id, h.name || "the next watcher")} is up. Their online status is out of date, so check before you hand off.</div>`;
+    }
+    return `<div class="tocw-watch-banner on">✅ Handoff ready — ${profileLink(h.id, h.name || "")} is online (in ${duration(h.endsIn)})</div>`;
   }
 
   function renderLive(chain, remaining, bonus, bonusPct, current, next) {
@@ -2227,11 +3186,13 @@
     const currentOffline = current?.watcher_id && current.watcher_online_status !== "Online";
     const facPace = attacks?.pace?.faction;
     const bonusEta = bonus ? etaText(bonus.toGo, facPace) : "";
+    const warm = chainWarmup();
+    const toStart = warm ? CHAIN_WARMUP_HITS - chain.current : 0;
     return `
       <div class="tocw-card">
         <div class="tocw-grid">
           <div>
-            <div class="tocw-muted">Drop timer</div>
+            <div class="tocw-muted">${warm ? "Warm-up ends in" : "Drop timer"}</div>
             <div class="tocw-big ${timerUrgencyClass(remaining)}" id="tocw-timer">${duration(remaining)}</div>
           </div>
           <div>
@@ -2239,6 +3200,7 @@
             <div class="tocw-big">${chain.current}</div>
           </div>
         </div>
+        ${warm ? `<div class="tocw-muted" style="margin-top:8px;">Not a chain yet — <strong>${toStart}</strong> more hit${toStart === 1 ? "" : "s"} inside the timer to start one.</div>` : ""}
         ${bonus ? `<div class="tocw-muted" style="margin-top:8px;">Next bonus: ${bonus.toGo} to ${bonus.target}${bonusEta ? ` (${bonusEta})` : ""}</div><div class="tocw-progress"><span style="width:${bonusPct}%"></span></div>` : ""}
       </div>
       ${renderHitButton(remaining)}
@@ -2258,7 +3220,7 @@
       ${currentOffline ? `<div class="tocw-alert bad">Current watcher is not online.</div>` : ""}
       <div class="tocw-card">
         <div class="tocw-card-title">Last attack</div>
-        ${attacks.last ? `<div>${escapeHtml(attacks.last.attackerName)} vs ${escapeHtml(attacks.last.defenderName)} - ${duration(Math.floor(Date.now() / 1000 - attacks.last.timestamp))} ago</div>` : `<div class="tocw-muted">${escapeHtml(attacks.error || "Attack log unavailable.")}</div>`}
+        ${attacks.last ? `<div>${attacks.last.attackerId ? profileLink(attacks.last.attackerId, rosterName(attacks.last.attackerId, attacks.last.attackerName)) : escapeHtml(attacks.last.attackerName)} vs ${escapeHtml(attacks.last.defenderName)} - ${duration(Math.floor(Date.now() / 1000 - attacks.last.timestamp))} ago</div>` : `<div class="tocw-muted">${escapeHtml(attacks.error || "Attack log unavailable.")}</div>`}
       </div>
       ${renderLeaderboard(attacks)}
     `;
@@ -2268,20 +3230,53 @@
   // (signup.roster in token mode; watch.roster for managers). This upgrades a slot
   // stored as a bare "ID <n>" client-side, so names read right even before the backend
   // re-resolution deploys. Falls back to the stored name / id when the roster can't help.
+  // OUR roster first. The backend's payload roster is empty for an identity-only session
+  // whenever its 25s cache is cold, which is most of the time — that's why slots that used
+  // to read "Alice" started reading "ID 12345". The locally-fetched roster doesn't have
+  // that problem, so it wins; the payload roster stays as a fallback for keyless viewers.
   function rosterName(id, fallback) {
     const nid = Number(id);
     if (!Number.isFinite(nid) || nid <= 0) return fallback;
+    const own = state.tornRoster?.[nid]?.name;
+    if (own && !/^ID \d+$/.test(own)) return own;
     const roster = state.signup?.roster || state.watch?.roster || [];
     const member = roster.find((r) => Number(r.id) === nid);
     const name = member && typeof member.name === "string" ? member.name.trim() : "";
     return name && !/^ID \d+$/.test(name) ? name : fallback;
   }
 
+  // Online status for the dot. The payload's value is null when the backend had no roster,
+  // so fall back to what our own roster fetch saw.
+  function rosterStatus(id, fallback) {
+    if (fallback) return fallback;
+    const nid = Number(id);
+    if (!Number.isFinite(nid) || nid <= 0) return fallback;
+    return state.tornRoster?.[nid]?.status ?? fallback;
+  }
+
+  // A member's name as a link to their Torn profile. Falls back to plain text when we have
+  // no id to link to, so it's safe to use everywhere a name is rendered.
+  function profileLink(id, name) {
+    const nid = Number(id);
+    const label = escapeHtml(name);
+    if (!Number.isFinite(nid) || nid <= 0) return label;
+    return `<a class="tocw-who" href="https://www.torn.com/profiles.php?XID=${nid}" target="_blank" rel="noreferrer noopener" title="Open ${label}'s profile">${label}</a>`;
+  }
+
+  // The common "dot + linked name + status" cell.
+  function memberCell(id, fallbackName, statusRaw) {
+    const status = rosterStatus(id, statusRaw);
+    const name = rosterName(id, fallbackName);
+    // The dot carries the status as a tooltip so the word beside it can be dropped on
+    // narrow screens without losing the information.
+    return `<span class="tocw-dot ${statusClass(status)}" title="${escapeHtml(status || "Status unknown")}"></span>${profileLink(id, name)}`;
+  }
+
   function renderWatcherLine(shift, fallback) {
     if (!shift?.watcher_id) return `<div class="tocw-muted">${escapeHtml(fallback)}</div>`;
-    const tone = statusClass(shift.watcher_online_status);
+    const status = rosterStatus(shift.watcher_id, shift.watcher_online_status);
     const name = rosterName(shift.watcher_id, shift.watcher_name || `ID ${shift.watcher_id}`);
-    return `<div><span class="tocw-dot ${tone}"></span><strong>${escapeHtml(name)}</strong> <span class="tocw-muted">${escapeHtml(shift.watcher_online_status || "Unknown")}</span></div>`;
+    return `<div><span class="tocw-dot ${statusClass(status)}"></span><strong>${profileLink(shift.watcher_id, name)}</strong> <span class="tocw-muted">${escapeHtml(status || "Unknown")}</span></div>`;
   }
 
   function renderLeaderboard(attacks) {
@@ -2294,7 +3289,7 @@
             <table class="tocw-table">
               <thead><tr><th>Member</th><th>Hits</th><th>Respect</th><th>Avg</th></tr></thead>
               <tbody>
-                ${rows.map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${r.hits}</td><td>${r.respect.toFixed(1)}</td><td>${r.avg.toFixed(2)}</td></tr>`).join("")}
+                ${rows.map((r) => `<tr><td>${r.playerId ? profileLink(r.playerId, rosterName(r.playerId, r.name)) : escapeHtml(r.name)}</td><td>${r.hits}</td><td>${r.respect.toFixed(1)}</td><td>${r.avg.toFixed(2)}</td></tr>`).join("")}
               </tbody>
             </table>
           </div>
@@ -2377,7 +3372,7 @@
     }
 
     const who = assigned
-      ? `<span class="tocw-dot ${statusClass(onlineStatus)}"></span>${escapeHtml(rosterName(watcherId, watcherName || `ID ${watcherId}`))} <span class="tocw-muted">${escapeHtml(onlineStatus || "")}</span>`
+      ? `${memberCell(watcherId, watcherName || `ID ${watcherId}`, onlineStatus)} <span class="tocw-muted tocw-slot__status">${escapeHtml(rosterStatus(watcherId, onlineStatus) || "")}</span>`
       : locked
         ? `<span class="tocw-muted">Locked</span>`
         : `<span class="tocw-muted">Open</span>`;
@@ -2396,6 +3391,10 @@
   function renderSignupShifts() {
     const signup = state.signup;
     if (!signup || !signup.event) return "";
+    // A keyless caller gets an event stub with needs_verification and NO shifts. Rendering
+    // the card anyway produced an empty sheet under a "Signups are closed for this chain"
+    // note — which is not what's happening. The key gate above already says what to do.
+    if (signup.needs_verification) return "";
     const shifts = signup.shifts || [];
     const identity = getSignupIdentity();
     const canClaim = Boolean(signup.can_claim);
@@ -2414,7 +3413,7 @@
       <div class="tocw-card">
         <div class="tocw-card-title">Chainwatch shifts</div>
         ${identity && identity.id != null
-          ? `<div class="tocw-muted">Signed in as ${escapeHtml(rosterName(identity.id, identity.name || `ID ${identity.id}`))} ✓</div>`
+          ? `<div class="tocw-muted">Signed in as ${profileLink(identity.id, rosterName(identity.id, identity.name || `ID ${identity.id}`))} ✓</div>`
           : canClaim
             ? `<div class="tocw-muted">Signing up verifies you with your Torn key${settings().tornKey || settings().sessionToken ? "" : " — add it in Settings"}.</div>`
             : ""}
@@ -2453,7 +3452,7 @@
     }
 
     const who = filled
-      ? `<span class="tocw-dot ${statusClass(slot.online_status)}"></span>${escapeHtml(rosterName(slot.watcher_id, slot.watcher_name || `ID ${slot.watcher_id}`))}${slot.verified ? "" : ` <span class="tocw-muted">(unverified)</span>`}`
+      ? `${memberCell(slot.watcher_id, slot.watcher_name || `ID ${slot.watcher_id}`, slot.online_status)}${slot.verified ? "" : ` <span class="tocw-muted">(unverified)</span>`}`
       : locked
         ? `<span class="tocw-muted">Locked</span>`
         : `<span class="tocw-muted">Open</span>`;
@@ -2517,15 +3516,11 @@
       if (action === "signup") {
         state.watch = await callFunction("chain-watch", { action: "signup", shift_id: shiftId, role });
         state.notice = role === "backup" ? "Backup slot claimed." : "Shift claimed.";
-      } else if (action === "assign") {
-        const watcherId = promptWatcherId();
-        if (!watcherId) return;
-        state.watch = await callFunction("chain-watch", { action: "assign", shift_id: shiftId, watcher_id: watcherId, role });
-        state.notice = "Slot assigned.";
-      } else if (action === "clear") {
-        if (!confirm("Clear this chainwatch slot?")) return;
-        state.watch = await callFunction("chain-watch", { action: "clear", shift_id: shiftId, role });
-        state.notice = "Slot cleared.";
+      } else if (action === "assign" || action === "clear") {
+        // Both open an inline card; submitSlotAction performs the call. Assign picks from
+        // the roster we already hold rather than asking for an exact name from memory.
+        openSlotAction(action, shiftId, role);
+        return;
       } else if (action === "lock" || action === "unlock") {
         state.watch = await callFunction("chain-watch", {
           action: action === "lock" ? "lock_slot" : "unlock_slot",
@@ -2534,12 +3529,11 @@
         });
         state.notice = action === "lock" ? "Slot locked." : "Slot unlocked.";
       } else if (action === "schedule") {
-        const scheduled = promptSchedule();
-        if (!scheduled) return;
-        // Create a DRAFT — publishing (and minting the public signup link) stays on the
-        // site, so the script never creates a half-configured live event.
-        state.watch = await callFunction("chain-watch", { action: "save_event", ...scheduled, draft: true });
-        state.notice = "Draft chain created — publish it on the Overseer site to open signups and mint the link.";
+        // Opens the inline form; submitScheduleForm does the save (a DRAFT — publishing
+        // and minting the public link stays on the site, so the script never creates a
+        // half-configured live event).
+        state.scheduleOpen = true;
+        state.scheduleForm.error = null;
       }
       render();
     } catch (e) {
@@ -2548,41 +3542,239 @@
     }
   }
 
-  function promptWatcherId() {
-    const roster = state.watch?.roster || [];
-    const value = prompt("Assign watcher by player ID or exact name:");
-    if (value == null) return null;
-    const clean = value.trim();
-    if (!clean) return null;
-    const numeric = Number(clean);
-    if (Number.isInteger(numeric) && numeric > 0) return numeric;
-    const found = roster.find((m) => String(m.name).toLowerCase() === clean.toLowerCase());
-    if (found) return Number(found.id);
-    alert("No current faction member found by that exact name. Try their player ID.");
-    return null;
-  }
+  // --- Inline slot actions (assign / clear) --------------------------------------------
+  // These replaced window.prompt + window.confirm. Both were rough on PDA — native dialogs
+  // over a webview — but the real problem was "type the member's EXACT name", which fails
+  // on a typo, on capitalisation, and on any name with punctuation, with an alert() as the
+  // only feedback. We already hold the full roster (fetched with the member's own key), so
+  // the right interaction is picking from it, not retyping it from memory.
 
-  function promptSchedule() {
-    const title = prompt("Chain title:", "Chain Night");
-    if (title == null || !title.trim()) return null;
-    const start = prompt("Start time in TCT/UTC (YYYY-MM-DD HH:mm):");
-    if (start == null || !start.trim()) return null;
-    const durationRaw = prompt("Duration in hours:", "6");
-    if (durationRaw == null) return null;
-    const durationHours = Number(durationRaw);
-    const iso = parseTctInput(start);
-    if (!iso || !Number.isInteger(durationHours) || durationHours < 1 || durationHours > 24) {
-      alert("Invalid start time or duration.");
-      return null;
+  // The roster as a sorted list. Prefers the one we fetched ourselves, since the backend's
+  // is manager-only and usually empty for an identity-only session.
+  function rosterList() {
+    const own = state.tornRoster;
+    if (own && Object.keys(own).length) {
+      return Object.entries(own)
+        .map(([id, m]) => ({ id: Number(id), name: m?.name || `ID ${id}`, status: m?.status ?? null }))
+        .sort((a, b) => a.name.localeCompare(b.name));
     }
-    return { title: title.trim(), starts_at: iso, duration_hours: durationHours };
+    const payload = state.signup?.roster || state.watch?.roster || [];
+    return payload
+      .map((m) => ({ id: Number(m?.id), name: String(m?.name ?? `ID ${m?.id}`), status: m?.online_status ?? null }))
+      .filter((m) => Number.isFinite(m.id) && m.id > 0)
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  // Name substring OR id prefix, so both "ali" and "1234" narrow the list.
+  function filterRoster(list, query) {
+    const q = String(query || "").trim().toLowerCase();
+    if (!q) return list;
+    return list.filter((m) => m.name.toLowerCase().includes(q) || String(m.id).startsWith(q));
+  }
+
+  function openSlotAction(kind, shiftId, role) {
+    state.slotAction = { kind, shiftId, role, query: "", error: null, busy: false };
+    render();
+  }
+
+  function closeSlotAction() {
+    state.slotAction = null;
+    render();
+  }
+
+  function slotActionShift() {
+    const sa = state.slotAction;
+    if (!sa) return null;
+    return (state.watch?.shifts || []).find((s) => Number(s.id) === Number(sa.shiftId)) || null;
+  }
+
+  function slotActionLabel() {
+    const sa = state.slotAction;
+    const shift = slotActionShift();
+    const when = shift ? `${hhmmTct(shift.shift_start)}–${hhmmTct(shift.shift_end)} TCT` : "this shift";
+    return `${sa.role === "backup" ? "Backup" : "Main"} · ${when}`;
+  }
+
+  function renderSlotActionForm() {
+    const sa = state.slotAction;
+    if (!sa) return "";
+    const shift = slotActionShift();
+    const heldId = shift ? (sa.role === "backup" ? shift.backup_watcher_id : shift.watcher_id) : null;
+    const heldName = shift ? (sa.role === "backup" ? shift.backup_watcher_name : shift.watcher_name) : null;
+    const err = sa.error ? `<div class="tocw-alert bad" style="margin-bottom:8px;">${escapeHtml(sa.error)}</div>` : "";
+
+    if (sa.kind === "clear") {
+      // Names the person and the slot, which a bare "Clear this chainwatch slot?" never did.
+      const who = heldId ? rosterName(heldId, heldName || `ID ${heldId}`) : "this slot";
+      return `
+        <div class="tocw-card" style="border-color:#651922;">
+          <div class="tocw-card-title">Clear ${escapeHtml(slotActionLabel())}?</div>
+          <div class="tocw-muted">This removes <strong>${escapeHtml(who)}</strong> from the slot. They can be reassigned afterwards.</div>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;">
+            <button id="tocw-slot-cancel" class="small">Cancel</button>
+            <button id="tocw-slot-confirm" class="small primary" ${sa.busy ? "disabled" : ""}>${sa.busy ? "Clearing…" : "Clear slot"}</button>
+          </div>
+        </div>
+      `;
+    }
+
+    const all = rosterList();
+    const matches = filterRoster(all, sa.query);
+    const shown = matches.slice(0, 30);
+    const idQuery = /^\d{1,10}$/.test(sa.query.trim()) ? Number(sa.query.trim()) : null;
+    return `
+      <div class="tocw-card tocw-settings" style="border-color:#3a5573;">
+        <div class="tocw-card-title">Assign ${escapeHtml(slotActionLabel())}</div>
+        ${err}
+        <label style="margin-bottom:8px;">Search the roster <span class="tocw-muted">— name or player ID</span>
+          <input id="tocw-slot-search" value="${escapeHtml(sa.query)}" placeholder="Start typing a name…" autocomplete="off" />
+        </label>
+        ${all.length
+          ? `<div class="tocw-picker">
+              ${shown.map((m) => `
+                <button type="button" class="tocw-pick" data-tocw-pick="${m.id}" ${sa.busy ? "disabled" : ""}>
+                  <span class="tocw-dot ${statusClass(m.status)}" title="${escapeHtml(m.status || "Status unknown")}"></span>
+                  <span class="tocw-pick__name">${escapeHtml(m.name)}</span>
+                  <span class="tocw-muted">${m.id}</span>
+                </button>`).join("")}
+              ${matches.length > shown.length ? `<div class="tocw-muted" style="padding:6px 2px;">+${matches.length - shown.length} more — keep typing to narrow it.</div>` : ""}
+              ${!matches.length ? `<div class="tocw-muted" style="padding:6px 2px;">No member matches that.${idQuery ? "" : " You can also type a player ID."}</div>` : ""}
+            </div>`
+          : `<div class="tocw-muted">No roster loaded — your key may lack faction access. You can still assign by player ID.</div>`}
+        ${idQuery && !matches.some((m) => m.id === idQuery)
+          ? `<button type="button" class="tocw-pick" data-tocw-pick="${idQuery}" style="margin-top:6px;">Assign player ID <strong>${idQuery}</strong></button>`
+          : ""}
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;">
+          <button id="tocw-slot-cancel" class="small">Cancel</button>
+        </div>
+      </div>
+    `;
+  }
+
+  async function submitSlotAction(watcherId) {
+    const sa = state.slotAction;
+    if (!sa || sa.busy) return;
+    sa.busy = true;
+    sa.error = null;
+    render();
+    try {
+      if (sa.kind === "clear") {
+        state.watch = await callFunction("chain-watch", { action: "clear", shift_id: sa.shiftId, role: sa.role });
+        state.notice = "Slot cleared.";
+      } else {
+        state.watch = await callFunction("chain-watch", {
+          action: "assign", shift_id: sa.shiftId, watcher_id: Number(watcherId), role: sa.role,
+        });
+        state.notice = "Slot assigned.";
+      }
+      state.slotAction = null;
+    } catch (e) {
+      sa.busy = false;
+      sa.error = e.message || "Action failed.";
+    }
+    render();
+  }
+
+  // Validate the schedule form's three fields, returning either the payload or the first
+  // problem. Pure, so it's unit-testable and shared by the form and any caller.
+  function validateSchedule(title, startRaw, durationRaw) {
+    const cleanTitle = String(title || "").trim();
+    if (!cleanTitle) return { error: "Give the chain a title." };
+    const iso = parseTctInput(String(startRaw || ""));
+    if (!iso) return { error: "Start time must look like 2026-08-14 20:00 (TCT)." };
+    const hours = Number(durationRaw);
+    if (!Number.isInteger(hours) || hours < 1 || hours > 24) {
+      return { error: "Duration must be a whole number of hours, 1 to 24." };
+    }
+    return { value: { title: cleanTitle.slice(0, 80), starts_at: iso, duration_hours: hours } };
+  }
+
+  // Inline scheduling form, replacing three chained window.prompt() calls. Those were
+  // rough on mobile/PDA, and cancelling at the third step silently threw away the first
+  // two answers. This keeps what you typed, validates in place, and shows the error next
+  // to the fields instead of in an alert().
+  function renderScheduleForm() {
+    if (!state.scheduleOpen) return "";
+    const f = state.scheduleForm;
+    return `
+      <div class="tocw-card tocw-settings" style="border-color:#3a5573;">
+        <div class="tocw-card-title">Schedule a chain (draft)</div>
+        ${f.error ? `<div class="tocw-alert bad" style="margin-bottom:8px;">${escapeHtml(f.error)}</div>` : ""}
+        <label>Title
+          <input id="tocw-sched-title" value="${escapeHtml(f.title)}" placeholder="Chain Night" />
+        </label>
+        <label>Start (TCT / UTC)
+          <input id="tocw-sched-start" value="${escapeHtml(f.start)}" placeholder="YYYY-MM-DD HH:mm" />
+        </label>
+        <label>Duration (hours)
+          <input id="tocw-sched-hours" type="number" min="1" max="24" step="1" value="${escapeHtml(f.hours)}" />
+        </label>
+        <div class="tocw-muted" style="margin-bottom:8px;">Creates a draft — publish it on the Overseer site to open signups and mint the link.</div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button id="tocw-sched-cancel" class="small">Cancel</button>
+          <button id="tocw-sched-save" class="small primary">Create draft</button>
+        </div>
+      </div>
+    `;
+  }
+
+  // Read the form back into state so a re-render (poll, tick) never discards typing.
+  function captureScheduleForm() {
+    if (!state.scheduleOpen) return;
+    const t = document.getElementById("tocw-sched-title");
+    const s = document.getElementById("tocw-sched-start");
+    const h = document.getElementById("tocw-sched-hours");
+    if (t) state.scheduleForm.title = String(t.value);
+    if (s) state.scheduleForm.start = String(s.value);
+    if (h) state.scheduleForm.hours = String(h.value);
+  }
+
+  async function submitScheduleForm() {
+    captureScheduleForm();
+    const f = state.scheduleForm;
+    const res = validateSchedule(f.title, f.start, f.hours);
+    if (res.error) {
+      f.error = res.error;
+      render();
+      return;
+    }
+    try {
+      state.watch = await callFunction("chain-watch", { action: "save_event", ...res.value, draft: true });
+      state.scheduleOpen = false;
+      state.scheduleForm = { title: "", start: "", hours: "6", error: null };
+      state.notice = "Draft chain created — publish it on the Overseer site to open signups and mint the link.";
+    } catch (e) {
+      f.error = e.message || "Could not create the draft.";
+    }
+    render();
+  }
+
+  // Parse "YYYY-MM-DD HH:mm" (TCT/UTC unless an explicit offset is given) → ISO, or null.
+  //
+  // The shape MUST be checked before handing anything to Date. V8's parser is lenient to
+  // the point of being dangerous here: new Date("garbage:00Z") returns 1 Jan 2000 rather
+  // than an invalid date, so the previous version silently accepted any typo and scheduled
+  // the chain for the year 2000. It also rolls 2026-02-31 forward into March instead of
+  // rejecting it, so the fields are round-tripped below.
   function parseTctInput(value) {
-    const clean = value.trim().replace(" ", "T");
-    const iso = /z$/i.test(clean) || /[+-]\d\d:?\d\d$/.test(clean) ? clean : `${clean}:00Z`;
+    const clean = String(value || "").trim().replace(" ", "T");
+    const m = clean.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(:\d{2})?(Z|[+-]\d{2}:?\d{2})?$/i);
+    if (!m) return null;
+    const iso = `${clean}${m[6] ? "" : ":00"}${m[7] ? "" : "Z"}`;
     const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    if (Number.isNaN(d.getTime())) return null;
+    // With no explicit offset the input is UTC, so the UTC fields must match what was
+    // typed — this is what rejects 2026-02-31 rather than quietly moving it to 3 March.
+    if (!m[7]) {
+      if (
+        d.getUTCFullYear() !== Number(m[1]) ||
+        d.getUTCMonth() + 1 !== Number(m[2]) ||
+        d.getUTCDate() !== Number(m[3]) ||
+        d.getUTCHours() !== Number(m[4]) ||
+        d.getUTCMinutes() !== Number(m[5])
+      ) return null;
+    }
+    return d.toISOString();
   }
 
   // Paste-ready status block for faction chat: state of the chain + coverage at a
@@ -2597,8 +3789,12 @@
     if (chain?.active) lines.push(`LIVE: ${chain.current} hits · ${duration(chainRemaining())} to drop`);
     else if (event) lines.push(`Next: ${event.title} — ${tctTime(event.starts_at, true)}`);
     else lines.push("No chain scheduled");
-    lines.push(current?.watcher_id ? `On watch: ${current.watcher_name} (${current.watcher_online_status})` : "On watch: nobody ⚠️");
-    lines.push(next?.watcher_id ? `Next: ${next.watcher_name} @ ${tctTime(next.shift_start)} (${next.watcher_online_status})` : "Next: unassigned ⚠️");
+    lines.push(current?.watcher_id
+      ? `On watch: ${rosterName(current.watcher_id, current.watcher_name || `ID ${current.watcher_id}`)} (${rosterStatus(current.watcher_id, current.watcher_online_status) || "Unknown"})`
+      : "On watch: nobody ⚠️");
+    lines.push(next?.watcher_id
+      ? `Next: ${rosterName(next.watcher_id, next.watcher_name || `ID ${next.watcher_id}`)} @ ${tctTime(next.shift_start)} (${rosterStatus(next.watcher_id, next.watcher_online_status) || "Unknown"})`
+      : "Next: unassigned ⚠️");
     if (h && h.state === "risk") lines.push(`🚨 Handoff: ${h.name} isn't online`);
     if (h && h.state === "gap") lines.push("🚨 Handoff: no watcher after the current shift");
     if (gaps.length) lines.push(`⚠️ Unmanned: ${gaps.slice(0, 6).map((iso) => tctTime(iso).replace(" TCT", "")).join(", ")} TCT`);
@@ -2610,6 +3806,14 @@
       state.notice = text;
     }
     render();
+  }
+
+  // Should "Connection & setup" render expanded? Open it when there's no key (the key
+  // field is the one thing that member needs, and burying it at the bottom of a collapsed
+  // section made them hunt for it), when something sent them here to set the key, or when
+  // they had it open before the last rebuild.
+  function connectionOpen() {
+    return needsKey() || state.settingsExpandConnection || state.connectionWasOpen;
   }
 
   // Settings render INSIDE the panel body (not a floating modal) — so they inherit the
@@ -2630,6 +3834,14 @@
           <textarea id="tocw-set-target-ids" rows="3" placeholder="123456&#10;789012&#10;…">${escapeHtml(state.targetIds.join("\n"))}</textarea>
         </label>
         <div class="tocw-muted">The ⚔️ HIT button opens each one in turn (one per click), so you hit down your list.${state.targetIds.length ? ` ${state.targetIds.length} target${state.targetIds.length === 1 ? "" : "s"} · currently at #${idx}. <button id="tocw-target-reset" class="small" type="button">Restart</button>` : ""}</div>
+        ${effHitUrl() ? `
+          <div class="tocw-muted" style="margin-top:8px;border-top:1px solid #2b3d52;padding-top:8px;">
+            You still have an old single-target link saved from before the list existed:
+            <code style="word-break:break-all;">${escapeHtml(effHitUrl())}</code>.
+            It's only used when the list above is empty. Nothing writes it any more, so it was
+            invisible until now.
+            <button id="tocw-hit-url-clear" class="small" type="button" style="margin-top:6px;">Forget it</button>
+          </div>` : ""}
       </div>
 
       <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
@@ -2676,7 +3888,7 @@
           </div>` : ""}
       </div>
 
-      <details style="margin-top:10px;">
+      <details id="tocw-conn-details" ${connectionOpen() ? "open" : ""} style="margin-top:10px;">
         <summary class="tocw-muted" style="cursor:pointer;font-weight:700;">Connection &amp; setup</summary>
         <div style="margin-top:10px;">
           <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— connects your site session AND fetches the live chain/leaderboard for zero-lag data</span>
@@ -2772,7 +3984,19 @@
       state.settingsOpen = false;
       render();
     };
+    const details = document.getElementById("tocw-conn-details");
+    details?.addEventListener("toggle", () => {
+      state.connectionWasOpen = Boolean(details.open);
+      // A deliberate collapse should stick, so clear the one-shot "expand it for them".
+      if (!details.open) state.settingsExpandConnection = false;
+    });
     document.getElementById("tocw-set-back")?.addEventListener("click", close);
+    document.getElementById("tocw-hit-url-clear")?.addEventListener("click", () => {
+      state.hitUrlPref = "";
+      gmSet(STORE.hitUrl, "");
+      state.notice = "Old single-target link forgotten.";
+      close();
+    });
     document.getElementById("tocw-target-reset")?.addEventListener("click", () => {
       state.targetIndex = 0;
       gmSet(STORE.targetIndex, 0);
@@ -2797,8 +4021,24 @@
       state.alarmVolume = prevVol;
     });
     document.getElementById("tocw-modal-save")?.addEventListener("click", () => {
+      const prevKey = settings().tornKey;
+      const prevSession = settings().sessionToken;
       const ok = saveSettings(collect());
       applyAlarmSettings();
+      // Compare the key's VALUE, not just its presence: replacing a rejected key with a
+      // working one is the main recovery path, and it would otherwise sit out the
+      // connect throttle doing nothing.
+      const nextKey = settings().tornKey;
+      const keyChanged = Boolean(nextKey) && nextKey !== prevKey;
+      // A different key is a different identity, so the session minted from the old one is
+      // no longer valid for it — drop it and let ensureSessionFromKey mint a fresh one.
+      // Unless the member deliberately pasted a session token in this same save, which is
+      // an explicit override worth respecting.
+      if (keyChanged && settings().sessionToken === prevSession) {
+        gmSet(STORE.sessionToken, "");
+        gmSet(STORE.signupIdentity, null);
+      }
+      if (keyChanged) retryConnectNow();
       // Last-resort manual link entry: bind a pasted signup link/token.
       const pasted = extractSignupToken(valueOf("tocw-set-signup"));
       if (pasted) gmSet(STORE.signupToken, pasted);
@@ -2808,6 +4048,7 @@
         state.error = "Install Tampermonkey or use Torn PDA — your key and session can't be stored securely otherwise, so they were not saved.";
       }
       close();
+      if (keyChanged || pasted) void refreshAll(true);
     });
     document.getElementById("tocw-save-faction-config")?.addEventListener("click", async () => {
       // Managers push the CURRENT effective values as the faction-wide defaults, so
@@ -2839,6 +4080,7 @@
     });
     document.getElementById("tocw-modal-connect")?.addEventListener("click", async () => {
       saveSettings(collect());
+      retryConnectNow();
       try {
         const token = await connectSiteFromTornKey();
         document.getElementById("tocw-set-session").value = token;
@@ -2966,7 +4208,17 @@
     // release) each time visibility changes, and resume the poll loop on return.
     document.addEventListener("visibilitychange", () => {
       updateWakeLock();
-      if (document.visibilityState === "visible") scheduleNextRefresh();
+      // Drop the polling lease the moment this window is backgrounded, so the window the
+      // member is actually looking at picks it up rather than waiting out the lease.
+      if (document.visibilityState !== "visible") {
+        releasePollLeader();
+        return;
+      }
+      // Polling is paused while the tab is backgrounded, so coming back is exactly when
+      // the snapshot is oldest. Re-read immediately rather than waiting out a poll delay
+      // and showing the user a stale chain in the meantime.
+      if (chainStaleness().stale) void refreshAll(false);
+      else scheduleNextRefresh();
     });
     // Kick off the live-data loop (refreshAll re-arms itself via scheduleNextRefresh,
     // polling fast while a chain is live and easing off otherwise).
@@ -2980,6 +4232,9 @@
   // re-rendering the panel. Full re-renders happen on data polls (which preserve scroll).
   function tick() {
     try {
+      // Re-anchor to torn.com's own chain bar first, so everything below (alarms, the
+      // countdown, the staleness check) works off the freshest truth available.
+      syncChainFromSidebar();
       // Alarms run regardless of visibility — they exist to alert you when the panel
       // is collapsed or hidden and you're not watching it.
       evaluateAlarms();
@@ -3025,7 +4280,55 @@
     }
   }
 
-  if (document.readyState === "loading") {
+  if (!IS_BROWSER) {
+    // Node: export the pure helpers for the unit tests and never boot the UI.
+    if (typeof module === "object" && module && module.exports) {
+      module.exports = {
+        state,
+        parseChain,
+        parseAttacks,
+        serverLiveChain,
+        parseTargetIds,
+        parseThresholds,
+        cleanThresholdArray,
+        validHttpUrl,
+        compareVersions,
+        extractSignupToken,
+        parseResponseMeta,
+        stalenessFromMeta,
+        noteServerClock,
+        serverClockOffsetSec,
+        resetClockSamplesForTests,
+        validateSchedule,
+        parseTctInput,
+        currentAndNextShift,
+        render,
+        renderSlot,
+        renderSignupShifts,
+        renderKeyGate,
+        renderSlotActionForm,
+        rosterList,
+        filterRoster,
+        openSlotAction,
+        parseRoster,
+        rosterName,
+        rosterStatus,
+        profileLink,
+        absentMembers,
+        normalizedShifts,
+        coverageGaps,
+        handoffStatus,
+        chainWarmup,
+        chainStaleness,
+        chainRemaining,
+        nextBonus,
+        duration,
+        noteChainHits,
+        noteChainTimer,
+        clearChainEstimate,
+      };
+    }
+  } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });
   } else {
     boot();
