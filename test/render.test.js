@@ -42,7 +42,7 @@ function resetState() {
     watch: null, signup: null, chain: null, attacks: null,
     liveSource: null, settingsOpen: false, focus: false, hidden: false, collapsed: false,
     chainConfirmedAt: null, scheduleConfirmedAt: Date.now(),
-    tornRoster: null, slotAction: null, scheduleOpen: false,
+    tornRoster: null, rosterAt: null, slotAction: null, scheduleOpen: false,
     settingsExpandConnection: false, connectionWasOpen: false,
     tornFailCount: 0, chainSummary: null,
   });
@@ -291,4 +291,83 @@ test("watcher names link to their Torn profile", () => {
   );
   assert.match(out, /profiles\.php\?XID=111/);
   assert.match(out, />Alice</, "the locally-fetched roster resolves the ID placeholder");
+});
+
+// --- Online status: the panel must not accuse a watcher it can't vouch for -------------
+
+// A live chain with one in-progress shift, which is what puts the "Current watcher" card
+// and its offline alert on screen.
+function liveChainWithWatcher(payloadStatus) {
+  resetState();
+  cw.state.chain = { active: true, current: 40, timeout: 200, fetchedAt: Date.now(), start: Math.floor(Date.now() / 1000) - 600 };
+  cw.state.chainConfirmedAt = Date.now();
+  cw.state.liveSource = "torn";
+  cw.state.watch = {
+    event: { title: "Chain Night", status: "published", starts_at: new Date(Date.now() - 600e3).toISOString() },
+    viewer: { player_id: 999, can_manage: false },
+    shifts: [{
+      id: 1,
+      shift_start: new Date(Date.now() - 1800e3).toISOString(),
+      shift_end: new Date(Date.now() + 1800e3).toISOString(),
+      watcher_id: 111, watcher_name: "Alice", watcher_online_status: payloadStatus,
+    }],
+  };
+}
+
+test("an unknown online status does not render as offline", () => {
+  // The backend serves no roster to an identity-only session, so the flag is null — which
+  // the panel used to compare `!== "Online"` and announce as the watcher being away.
+  liveChainWithWatcher(null);
+  cw.render();
+  assert.match(html(), /Alice/, "the watcher card should be on screen");
+  assert.doesNotMatch(html(), /not online/, "no reading is not evidence of absence");
+  assert.match(html(), /Unknown/, "say we don't know instead");
+});
+
+test("the watcher card and the offline alert cannot disagree", () => {
+  // Exactly what members saw: the card said Online — resolved from our own roster fetch —
+  // while the alert underneath said the watcher was not online, because it read the raw
+  // payload flag (null) instead. One fact, two code paths, two answers. Both now go
+  // through statusInfo with the same arguments, so the pair can't come apart again.
+  liveChainWithWatcher(null);
+  cw.state.tornRoster = { 111: { name: "Alice", status: "Online" } };
+  cw.state.rosterAt = Date.now();
+  cw.render();
+
+  assert.match(html(), /Online/, "our roster resolves them as online");
+  assert.doesNotMatch(html(), /not online/, "so the alert must not contradict the card");
+});
+
+test("a confirmed offline status is still called out", () => {
+  liveChainWithWatcher("Offline");
+  cw.state.scheduleConfirmedAt = Date.now();
+  cw.render();
+  assert.match(html(), /is Offline, not online/, "a fresh reading may still raise the alarm");
+});
+
+test("a watcher who is actively hitting is never shown as offline", () => {
+  liveChainWithWatcher("Offline");
+  cw.state.scheduleConfirmedAt = Date.now() - 60e3;
+  cw.state.attacks = { leaderboard: [], last: null, error: null, hitAt: { 111: Math.floor(Date.now() / 1000) - 4 } };
+  cw.render();
+  assert.doesNotMatch(html(), /not online/, "a hit that just landed outranks a minute-old roster");
+});
+
+// --- Times that must keep moving between polls ----------------------------------------
+
+test("relative times tick without a rebuild", () => {
+  // "Last attack … ago" was baked into the HTML, so it only moved when a poll rebuilt the
+  // panel — advancing in 3-second jumps and sitting frozen in between.
+  liveChainWithWatcher("Online");
+  const ts = Math.floor(Date.now() / 1000) - 5;
+  cw.state.attacks = { leaderboard: [], error: null, hitAt: {}, last: { attackerId: 111, attackerName: "Alice", defenderName: "Foe", timestamp: ts } };
+  cw.render();
+
+  const span = panel().querySelector("[data-tocw-since]");
+  assert.ok(span, "the elapsed time needs an anchor tick() can find");
+  assert.equal(span.textContent, "00:05");
+
+  span.setAttribute("data-tocw-since", String(ts - 7)); // stand in for 7s passing
+  cw.tickRelativeTimes(panel());
+  assert.equal(span.textContent, "00:12", "tick rewrites it in place, no rebuild");
 });

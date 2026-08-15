@@ -26,6 +26,8 @@ function resetState() {
     scheduleConfirmedAt: Date.now(),
     chainDeadline: null,
     chainRunHits: null,
+    tornRoster: null,
+    rosterAt: null,
   });
 }
 
@@ -466,11 +468,82 @@ test("rosterName ignores a payload name that is itself an ID placeholder", () =>
   assert.equal(cw.rosterName(111, "ID 111"), "Alice");
 });
 
-test("rosterStatus fills in an online status the backend left null", () => {
+// --- Online status: the "it says they're offline when they're not" family --------------
+
+test("statusInfo fills in an online status the backend left null", () => {
   resetState();
   cw.state.tornRoster = { 111: { name: "Alice", status: "Online" } };
-  assert.equal(cw.rosterStatus(111, null), "Online");
-  assert.equal(cw.rosterStatus(111, "Idle"), "Idle", "a real payload value still wins");
+  cw.state.rosterAt = Date.now();
+  assert.equal(cw.statusInfo(111, null).status, "Online");
+  assert.equal(cw.statusInfo(111, null).source, "roster");
+});
+
+test("an absent status is unknown, never offline", () => {
+  // The reported bug. An identity-only session gets no roster from the backend, so
+  // watcher_online_status is null — and `null !== "Online"` had the panel announcing the
+  // current watcher was offline having established nothing at all.
+  resetState();
+  const info = cw.statusInfo(111, null);
+  assert.equal(info.status, null);
+  assert.equal(cw.statusIsOffline(info), false, "no reading is not evidence of absence");
+  assert.equal(cw.statusText(info), "Unknown");
+  assert.notEqual(cw.statusClass(null), "bad", "unknown must not wear the offline dot");
+  assert.equal(cw.statusClass("Offline"), "bad");
+});
+
+test("statusInfo takes the freshest source, not a fixed pecking order", () => {
+  resetState();
+  cw.state.tornRoster = { 111: { name: "Alice", status: "Online" } };
+
+  cw.state.rosterAt = Date.now();
+  cw.state.scheduleConfirmedAt = Date.now() - 60e3;
+  assert.equal(cw.statusInfo(111, "Offline").status, "Online", "our newer roster wins");
+
+  cw.state.rosterAt = Date.now() - 60e3;
+  cw.state.scheduleConfirmedAt = Date.now();
+  assert.equal(cw.statusInfo(111, "Offline").status, "Offline", "the newer payload wins");
+});
+
+test("a status nothing has refreshed is reported as unconfirmed, not asserted", () => {
+  resetState();
+  cw.state.tornRoster = { 111: { name: "Alice", status: "Offline" } };
+  cw.state.rosterAt = Date.now() - 10 * 60e3;
+  const info = cw.statusInfo(111, null);
+  assert.equal(info.stale, true);
+  assert.equal(cw.statusIsOffline(info), false, "a ten-minute-old reading can't accuse anyone");
+  assert.equal(cw.statusText(info), "Unknown");
+});
+
+test("a hit we just watched land outranks a roster that says otherwise", () => {
+  // The case members actually hit: the watcher hammering the chain, listed as Offline
+  // because the roster snapshot behind that label predates them sitting down.
+  resetState();
+  cw.resetClockSamplesForTests(); // hit ages are measured against Torn's clock
+  cw.state.tornRoster = { 111: { name: "Alice", status: "Offline" } };
+  cw.state.rosterAt = Date.now() - 90e3;
+  cw.state.attacks = { hitAt: { 111: nowSec() - 5 } };
+
+  const info = cw.statusInfo(111, null);
+  assert.equal(info.status, "Online");
+  assert.equal(info.source, "hit");
+  assert.equal(cw.statusIsOffline(info), false);
+
+  // ...but an old hit proves nothing about now, so it doesn't override a fresh roster.
+  cw.state.attacks = { hitAt: { 111: nowSec() - 600 } };
+  cw.state.rosterAt = Date.now();
+  assert.equal(cw.statusInfo(111, null).status, "Offline");
+});
+
+test("parseAttacks records when each member last hit", () => {
+  const t = nowSec();
+  const raw = { attacks: [
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "X", timestamp_ended: t - 30, chain: 5 },
+    { attacker_id: 111, attacker_name: "Alice", defender_name: "Y", timestamp_ended: t - 5, chain: 6 },
+    { attacker_id: 222, attacker_name: "Bob", defender_name: "Z", timestamp_ended: t - 90, chain: 7 },
+  ] };
+  const out = cw.parseAttacks(raw, 111, 0, new Set([111, 222]));
+  assert.equal(out.hitAt[111], t - 5, "the most recent hit, not the first seen");
+  assert.equal(out.hitAt[222], t - 90);
 });
 
 test("profileLink builds a Torn profile link and escapes the name", () => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.26.2
+// @version      0.27.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -40,7 +40,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.26.2";
+      : "") || "0.27.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -81,7 +81,14 @@
   // some keyed caller happened to refresh it in the last 25 seconds, the payload comes back
   // with an empty roster and every name degrades to "ID 12345" with an unknown online dot.
   // We hold the key locally, so we can just resolve names ourselves. Rosters change slowly.
-  const ROSTER_MIN_INTERVAL = 300000;
+  //
+  // ONLINE STATUS does not, though, and it rides along on this same fetch — so a five-minute
+  // cadence meant the panel was making minute-to-minute claims ("current watcher is not
+  // online", the handoff nag) off data that could be five minutes old. One extra call a
+  // minute out of the account's 100/min is a cheap price for not calling a watcher offline
+  // while they sit there hitting. Names are unaffected either way; they never go stale.
+  const ROSTER_MIN_INTERVAL = 120000;
+  const ROSTER_LIVE_INTERVAL = 60000;
   // How long a chain snapshot may go unconfirmed before the panel stops presenting it as
   // live truth. Past this the HUD is badged STALE and says why, instead of quietly showing
   // a frozen hit count next to a countdown that keeps running. The Torn path re-confirms
@@ -102,10 +109,16 @@
   // run); user-overridable in Settings. Plus how early to warn before your own shift.
   const DEFAULT_DROP_THRESHOLDS = [60, 30, 10];
   const SHIFT_WARN_SECS = 300; // 5-minute heads-up before your shift
-  // Online status arrives on the throttled schedule poll, so it can be much older than the
-  // chain data. Past this the panel stops ASSERTING whether the next watcher is online —
-  // "they aren't online" is a claim worth being sure of before it wakes someone up.
-  const SCHEDULE_STALE_MS = 120000;
+  // Online status can be much older than the chain data — it rides the throttled schedule
+  // poll and the slow roster fetch, not the fast chain one. Past this the panel stops
+  // ASSERTING whether a watcher is online; "they aren't online" is a claim worth being sure
+  // of before it wakes someone up. One bar for every source (backend payload, our own
+  // roster read, a hit we watched land), or the panel would end up trusting a five-minute
+  // roster while distrusting a three-minute payload. It sits clear of both refresh cadences
+  // above on purpose: at 60s live / 120s idle a healthy panel never trips it, so tripping
+  // it means the status really has stopped refreshing — no faction API access, a dead poll
+  // — rather than the panel flapping on a boundary.
+  const STATUS_STALE_MS = 180000;
   const PACE_MIN_WINDOW_SEC = 10; // don't compute a hit/min pace off too short a sample
   const HANDOFF_WARN_SECS = 600; // start nagging about the next watcher 10m before your shift ends
 
@@ -207,6 +220,11 @@
     // Faction roster resolved from OUR key: { [playerId]: { name, status } }. Plain object
     // (not a Map) so it survives the JSON round-trip through the cross-tab shared snapshot.
     tornRoster: null,
+    // When that roster was fetched. It travels WITH the roster (rather than living in a
+    // module-local counter) so a follower tab adopting the leader's snapshot inherits the
+    // real age too — otherwise a follower held a perfectly good roster it believed was
+    // infinitely old, and refused to vouch for any status in it.
+    rosterAt: null,
     // Inline "schedule a chain" form (replaces three chained window.prompt calls). Held in
     // state so a background poll re-rendering the panel can't wipe what's been typed.
     scheduleOpen: false,
@@ -1100,6 +1118,11 @@
   function parseAttacks(raw, viewerId, windowStartSec, rosterIds) {
     const rows = asRows(raw?.attacks ?? raw);
     const byId = new Map();
+    // Unix seconds of each member's most recent counted hit. A plain object, both because
+    // it rides the cross-tab snapshot through JSON and because it's read by id. This is the
+    // strongest online signal the panel has: somebody who just landed a hit is at their
+    // keyboard, whatever a roster snapshot from minutes ago says about them.
+    const hitAt = {};
     let last = null;
     let total = 0;
     let yourHits = 0;
@@ -1137,6 +1160,7 @@
       if (timestamp > 0) {
         if (timestamp < minTs) minTs = timestamp;
         if (timestamp > maxTs) maxTs = timestamp;
+        if (timestamp > (hitAt[attackerId] || 0)) hitAt[attackerId] = timestamp;
       }
       if (timestamp > 0 && (!last || timestamp > last.timestamp)) {
         last = { attackerId, attackerName, defenderName, timestamp };
@@ -1165,7 +1189,7 @@
     // The attacks feed returns only the most recent ~100 attacks, so on a long chain this
     // is a RECENT WINDOW, not the whole chain. Report the count so the card can say so
     // rather than letting a 500-hit chain show a leaderboard summing to 100.
-    return { leaderboard, last, error: null, counted: total, mine: { hits: yourHits, ts: yourTs, respect: yourResp }, pace };
+    return { leaderboard, last, error: null, counted: total, mine: { hits: yourHits, ts: yourTs, respect: yourResp }, pace, hitAt };
   }
 
   // --- Cross-tab coordination ----------------------------------------------------------
@@ -1223,7 +1247,16 @@
 
   function publishSharedChain() {
     if (!state.chain) return;
-    lsSet(SHARED_KEY, { at: Date.now(), by: TAB_ID, chain: state.chain, attacks: state.attacks, roster: state.tornRoster });
+    lsSet(SHARED_KEY, {
+      at: Date.now(),
+      by: TAB_ID,
+      chain: state.chain,
+      attacks: state.attacks,
+      roster: state.tornRoster,
+      // WHEN the roster was read, not when it was published — a follower needs the real
+      // age to know whether the statuses in it are still worth asserting.
+      rosterAt: state.rosterAt,
+    });
   }
 
   // The follower path: adopt what the leader last published, if it's recent enough to be
@@ -1285,7 +1318,8 @@
   // their own slower cadence than the fast chain poll.
   let lastAttacksAt = 0;
   let lastScheduleAt = 0;
-  let lastRosterAt = 0;
+  // The roster's own timestamp lives in state.rosterAt, not here — it has to travel with
+  // the roster to the follower tabs that adopt it.
 
   // A key with no session was a dead end: panelMode() returns "none", so NEITHER schedule
   // branch in refreshAll ran, nothing ever minted a session, and the panel sat telling the
@@ -1386,7 +1420,13 @@
         if (shared) {
           state.chain = shared.chain;
           if (shared.attacks) state.attacks = shared.attacks;
-          if (shared.roster) state.tornRoster = shared.roster; // names too, not just the chain
+          if (shared.roster) {
+            // Names AND online status, with the age the leader read them at — not the age
+            // of the publish, and not "unknown", either of which would have this tab either
+            // over- or under-trusting statuses it did nothing wrong to obtain.
+            state.tornRoster = shared.roster;
+            state.rosterAt = num(shared.rosterAt) ?? shared.at;
+          }
           state.liveSource = "torn";
           state.tornFailCount = 0;
           state.chainConfirmedAt = shared.at;
@@ -1403,14 +1443,18 @@
             .catch((e) => { tornChainErr = e; }),
         );
         // Names + online status, resolved from our own key because the backend's
-        // identity-only session usually can't (see ROSTER_MIN_INTERVAL). Slow cadence:
-        // a roster changes far less often than a chain does.
-        if (manual || now - lastRosterAt >= ROSTER_MIN_INTERVAL) {
+        // identity-only session usually can't (see ROSTER_MIN_INTERVAL). Steps up while a
+        // chain is live or the viewer is on watch, because that's when the panel actually
+        // makes claims off the online flags; names alone would never need it.
+        const rosterEvery = state.chain?.active || viewerShiftStatus().active
+          ? ROSTER_LIVE_INTERVAL
+          : ROSTER_MIN_INTERVAL;
+        if (manual || state.rosterAt == null || now - state.rosterAt >= rosterEvery) {
           tasks.push(
             tornFetch("/faction/members")
               .then((raw) => {
                 const roster = parseRoster(raw);
-                if (roster) { state.tornRoster = roster; lastRosterAt = Date.now(); }
+                if (roster) { state.tornRoster = roster; state.rosterAt = Date.now(); }
               })
               .catch(() => { /* no faction access — fall back to whatever names the payload has */ }),
           );
@@ -1811,6 +1855,37 @@
     return Math.max(0, Math.floor((new Date(iso).getTime() - Date.now()) / 1000));
   }
 
+  // --- Times that have to keep moving between polls ------------------------------------
+  // A time value baked into the panel's HTML only changes when the panel is rebuilt, and
+  // rebuilds happen on the data poll — so "last attack … 00:07 ago" sat frozen and then
+  // jumped three seconds at a time, which reads as a broken clock rather than a clock
+  // that is merely coarse. The drop timer and the shift banner already had per-second
+  // updates, each hand-wired to its own element id; these two attributes generalise that,
+  // so anything time-relative can opt in by stamping its anchor and tick() will keep it
+  // honest without a rebuild:
+  //
+  //   data-tocw-since  unix seconds (TORN's clock) of a past event  → renders elapsed
+  //   data-tocw-until  epoch ms (the local clock) of a future one   → renders remaining
+  function elapsedSpan(tornUnixSec) {
+    return `<span data-tocw-since="${Number(tornUnixSec) || 0}">${duration(secondsSinceTorn(tornUnixSec) ?? 0)}</span>`;
+  }
+
+  function countdownSpan(seconds) {
+    const secs = Math.max(0, Math.floor(Number(seconds) || 0));
+    return `<span data-tocw-until="${Date.now() + secs * 1000}">${duration(secs)}</span>`;
+  }
+
+  function tickRelativeTimes(box) {
+    for (const el of box.querySelectorAll("[data-tocw-since]")) {
+      const secs = secondsSinceTorn(el.getAttribute("data-tocw-since"));
+      if (secs != null) el.textContent = duration(secs);
+    }
+    for (const el of box.querySelectorAll("[data-tocw-until]")) {
+      const at = Number(el.getAttribute("data-tocw-until"));
+      if (Number.isFinite(at)) el.textContent = duration((at - Date.now()) / 1000);
+    }
+  }
+
   function tctTime(iso, withDate = false) {
     if (!iso) return "--";
     const d = new Date(iso);
@@ -1850,10 +1925,85 @@
       `<span class="tocw-when-local">${local}<span class="tocw-when-zone"> local</span></span>`;
   }
 
+  // --- Online status: what we know, and how sure we are of it --------------------------
+  // The panel makes claims off this ("current watcher is not online", the handoff nag, the
+  // coloured dot), and it was making them off whatever value happened to be at hand. Two
+  // ways that went wrong, both reported as "it says they're offline when they're not":
+  //
+  //   - The backend payload's flag is NULL for an identity-only session whenever its 25s
+  //     roster cache is cold, which is most of the time. `null !== "Online"` is true, so
+  //     the panel announced the watcher was offline on no evidence whatsoever.
+  //   - Unknown and Offline rendered identically (statusClass fell through to the red dot),
+  //     so "we don't know" looked exactly like "they've gone".
+  //
+  // So statuses now travel WITH their age and the freshest source wins. Note the third
+  // source: a hit we watched land is proof of presence that no roster snapshot can beat.
+
+  // Seconds since a TORN unix timestamp, on a common clock. The member's own clock may be
+  // off by a minute either way (see noteServerClock) — which matters here, because a phone
+  // running fast makes a hit that just landed look minutes old.
+  function secondsSinceTorn(unixSec) {
+    const ts = num(unixSec);
+    if (!ts || ts <= 0) return null;
+    const offset = serverClockOffsetSec() ?? 0;
+    return Math.max(0, Math.floor(Date.now() / 1000 - offset - ts));
+  }
+
+  // Unix seconds of this member's most recent counted chain hit, or null. Only present on
+  // the direct-Torn attack parse; the backend leaderboard fallback carries no timestamps.
+  function lastHitAt(playerId) {
+    const ts = num(state.attacks?.hitAt?.[playerId]);
+    return ts && ts > 0 ? ts : null;
+  }
+
+  // { status, ageMs, stale, source } — best available reading for one member.
+  // `payloadStatus` is whatever the schedule payload had for them (may be null).
+  function statusInfo(id, payloadStatus) {
+    const nid = Number(id);
+    const now = Date.now();
+    const options = [];
+    if (payloadStatus) {
+      const at = state.scheduleConfirmedAt;
+      options.push({ status: payloadStatus, ageMs: at == null ? Infinity : now - at, source: "payload" });
+    }
+    if (Number.isFinite(nid) && nid > 0) {
+      const own = state.tornRoster?.[nid]?.status;
+      if (own) options.push({ status: own, ageMs: state.rosterAt == null ? Infinity : now - state.rosterAt, source: "roster" });
+      const hitAge = secondsSinceTorn(lastHitAt(nid));
+      if (hitAge != null) options.push({ status: "Online", ageMs: hitAge * 1000, source: "hit" });
+    }
+    if (!options.length) return { status: null, ageMs: Infinity, stale: true, source: null };
+    const best = options.reduce((a, b) => (b.ageMs < a.ageMs ? b : a));
+    return { ...best, stale: best.ageMs > STATUS_STALE_MS };
+  }
+
+  // True only when we can actually stand behind "they are not at their keyboard".
+  function statusIsOffline(info) {
+    return Boolean(info && info.status && !info.stale && info.status !== "Online");
+  }
+
   function statusClass(status) {
     if (status === "Online") return "ok";
     if (status === "Idle") return "warn";
-    return "bad";
+    if (status === "Offline") return "bad";
+    return ""; // unknown — the neutral grey dot, never the red one
+  }
+
+  // The dot only wears a colour we can defend; anything unconfirmed goes grey.
+  function statusDotClass(info) {
+    return info && !info.stale ? statusClass(info.status) : "";
+  }
+
+  // The word beside the dot. A reading we can no longer vouch for says so instead of
+  // repeating a status that may be minutes old.
+  function statusText(info) {
+    return info && info.status && !info.stale ? info.status : "Unknown";
+  }
+
+  function statusTitle(info) {
+    if (!info || info.status == null) return "Online status unknown — no recent reading";
+    if (!info.stale) return info.source === "hit" ? `${info.status} — hit ${duration(info.ageMs / 1000)} ago` : info.status;
+    return `Last known ${info.status}, ${duration(info.ageMs / 1000)} ago — not confirmed since`;
   }
 
   // --- The shift sheet, in ONE shape -----------------------------------------------
@@ -1982,25 +2132,14 @@
     // claiming "the next watcher isn't online" off a two-minute-old roster is how a panel
     // ends up waking someone to chase a watcher who has been at their desk the whole time.
     // Say we don't know instead — the handoff is still flagged, just without the false claim.
-    // A NAME is stable, so resolving it from any roster we have is always fine. ONLINE
-    // STATUS is not — it changes by the minute, and this decides whether to wake someone.
-    // So each source only counts while it's actually fresh: the payload's until the
-    // schedule goes stale, ours until the same age. Our roster refreshes on the slow
-    // ROSTER_MIN_INTERVAL, so it will often be too old to vouch for a status even though
-    // its names remain perfectly good — which is the honest split.
+    // A NAME is stable, so resolving it from any roster we have is always fine; the status
+    // goes through statusInfo, which picks the freshest source and reports its age.
     const name = rosterName(cover.id, cover.name || `ID ${cover.id}`);
-    const payloadStatus = scheduleStale() ? null : (cover.online ?? null);
-    const rosterFresh = lastRosterAt > 0 && Date.now() - lastRosterAt <= SCHEDULE_STALE_MS;
-    const ownStatus = rosterFresh ? (state.tornRoster?.[cover.id]?.status ?? null) : null;
-    const status = payloadStatus ?? ownStatus;
-    if (status == null) return { state: "unknown", endsIn, id: cover.id, name, online: null, stale: true };
-    return { state: status === "Online" ? "ready" : "risk", endsIn, id: cover.id, name, online: status, stale: false };
-  }
-
-  // True when the schedule payload (shifts + roster + online status) is old enough that
-  // its online flags shouldn't be treated as current.
-  function scheduleStale() {
-    return !isFresh(state.scheduleConfirmedAt, SCHEDULE_STALE_MS);
+    const info = statusInfo(cover.id, cover.online ?? null);
+    if (info.status == null || info.stale) {
+      return { state: "unknown", endsIn, id: cover.id, name, online: null, stale: true };
+    }
+    return { state: info.status === "Online" ? "ready" : "risk", endsIn, id: cover.id, name, online: info.status, stale: false };
   }
 
   // "~Xm" ETA to close a gap of `toGo` hits at `pacePerMin`. Empty when unknown.
@@ -3290,21 +3429,27 @@
   function renderHandoff() {
     const h = handoffStatus();
     if (!h) return "";
+    const inSecs = countdownSpan(h.endsIn);
     if (h.state === "gap") {
-      return `<div class="tocw-alert bad">🚨 Handoff gap — no watcher after this shift (ends in ${duration(h.endsIn)}). Get it covered.</div>`;
+      return `<div class="tocw-alert bad">🚨 Handoff gap — no watcher after this shift (ends in ${inSecs}). Get it covered.</div>`;
     }
     if (h.state === "risk") {
-      return `<div class="tocw-alert bad">🚨 Next watcher ${profileLink(h.id, h.name || "")} is ${escapeHtml(h.online || "not online")} — ping them (handoff in ${duration(h.endsIn)}).</div>`;
+      return `<div class="tocw-alert bad">🚨 Next watcher ${profileLink(h.id, h.name || "")} is ${escapeHtml(h.online || "not online")} — ping them (handoff in ${inSecs}).</div>`;
     }
     if (h.state === "unknown") {
-      return `<div class="tocw-alert">⏱️ Handoff in ${duration(h.endsIn)} — ${profileLink(h.id, h.name || "the next watcher")} is up. Their online status is out of date, so check before you hand off.</div>`;
+      return `<div class="tocw-alert">⏱️ Handoff in ${inSecs} — ${profileLink(h.id, h.name || "the next watcher")} is up. Their online status is out of date, so check before you hand off.</div>`;
     }
-    return `<div class="tocw-watch-banner on">✅ Handoff ready — ${profileLink(h.id, h.name || "")} is online (in ${duration(h.endsIn)})</div>`;
+    return `<div class="tocw-watch-banner on">✅ Handoff ready — ${profileLink(h.id, h.name || "")} is online (in ${inSecs})</div>`;
   }
 
   function renderLive(chain, remaining, bonus, bonusPct, current, next) {
     const attacks = state.attacks || { leaderboard: [], last: null, error: null };
-    const currentOffline = current?.watcher_id && current.watcher_online_status !== "Online";
+    // Only claim the watcher isn't there when a recent reading actually says so. This read
+    // the payload flag straight, so the usual case — an identity-only session, for which the
+    // backend serves no roster and the flag is null — compared `null !== "Online"` and the
+    // panel announced the current watcher was offline having never established anything.
+    const currentStatus = current?.watcher_id ? statusInfo(current.watcher_id, current.watcher_online_status) : null;
+    const currentOffline = statusIsOffline(currentStatus);
     const facPace = attacks?.pace?.faction;
     const bonusEta = bonus ? etaText(bonus.toGo, facPace) : "";
     const warm = chainWarmup();
@@ -3338,10 +3483,10 @@
         ${renderWatcherLine(next, "No next watcher")}
         <div class="tocw-muted">${next ? `Starts ${tctTime(next.shift_start)}` : ""}</div>
       </div>
-      ${currentOffline ? `<div class="tocw-alert bad">Current watcher is not online.</div>` : ""}
+      ${currentOffline ? `<div class="tocw-alert bad">Current watcher is ${escapeHtml(currentStatus.status)}, not online.</div>` : ""}
       <div class="tocw-card">
         <div class="tocw-card-title">Last attack</div>
-        ${attacks.last ? `<div>${attacks.last.attackerId ? profileLink(attacks.last.attackerId, rosterName(attacks.last.attackerId, attacks.last.attackerName)) : escapeHtml(attacks.last.attackerName)} vs ${escapeHtml(attacks.last.defenderName)} - ${duration(Math.floor(Date.now() / 1000 - attacks.last.timestamp))} ago</div>` : `<div class="tocw-muted">${escapeHtml(attacks.error || "Attack log unavailable.")}</div>`}
+        ${attacks.last ? `<div>${attacks.last.attackerId ? profileLink(attacks.last.attackerId, rosterName(attacks.last.attackerId, attacks.last.attackerName)) : escapeHtml(attacks.last.attackerName)} vs ${escapeHtml(attacks.last.defenderName)} - ${elapsedSpan(attacks.last.timestamp)} ago</div>` : `<div class="tocw-muted">${escapeHtml(attacks.error || "Attack log unavailable.")}</div>`}
       </div>
       ${renderLeaderboard(attacks)}
     `;
@@ -3366,14 +3511,10 @@
     return name && !/^ID \d+$/.test(name) ? name : fallback;
   }
 
-  // Online status for the dot. The payload's value is null when the backend had no roster,
-  // so fall back to what our own roster fetch saw.
-  function rosterStatus(id, fallback) {
-    if (fallback) return fallback;
-    const nid = Number(id);
-    if (!Number.isFinite(nid) || nid <= 0) return fallback;
-    return state.tornRoster?.[nid]?.status ?? fallback;
-  }
+  // (There is deliberately no age-blind rosterStatus() any more. Every caller of it was
+  // about to assert something — a dot colour, an alert, a line pasted into faction chat —
+  // and handing them a value with no age attached is how the panel came to call watchers
+  // offline. statusInfo is the only way in.)
 
   // A member's name as a link to their Torn profile. Falls back to plain text when we have
   // no id to link to, so it's safe to use everywhere a name is rendered.
@@ -3386,18 +3527,18 @@
 
   // The common "dot + linked name + status" cell.
   function memberCell(id, fallbackName, statusRaw) {
-    const status = rosterStatus(id, statusRaw);
+    const info = statusInfo(id, statusRaw);
     const name = rosterName(id, fallbackName);
     // The dot carries the status as a tooltip so the word beside it can be dropped on
     // narrow screens without losing the information.
-    return `<span class="tocw-dot ${statusClass(status)}" title="${escapeHtml(status || "Status unknown")}"></span>${profileLink(id, name)}`;
+    return `<span class="tocw-dot ${statusDotClass(info)}" title="${escapeHtml(statusTitle(info))}"></span>${profileLink(id, name)}`;
   }
 
   function renderWatcherLine(shift, fallback) {
     if (!shift?.watcher_id) return `<div class="tocw-muted">${escapeHtml(fallback)}</div>`;
-    const status = rosterStatus(shift.watcher_id, shift.watcher_online_status);
+    const info = statusInfo(shift.watcher_id, shift.watcher_online_status);
     const name = rosterName(shift.watcher_id, shift.watcher_name || `ID ${shift.watcher_id}`);
-    return `<div><span class="tocw-dot ${statusClass(status)}"></span><strong>${profileLink(shift.watcher_id, name)}</strong> <span class="tocw-muted">${escapeHtml(status || "Unknown")}</span></div>`;
+    return `<div><span class="tocw-dot ${statusDotClass(info)}" title="${escapeHtml(statusTitle(info))}"></span><strong>${profileLink(shift.watcher_id, name)}</strong> <span class="tocw-muted">${escapeHtml(statusText(info))}</span></div>`;
   }
 
   function renderLeaderboard(attacks) {
@@ -3498,7 +3639,7 @@
     }
 
     const who = assigned
-      ? `${memberCell(watcherId, watcherName || `ID ${watcherId}`, onlineStatus)} <span class="tocw-muted tocw-slot__status">${escapeHtml(rosterStatus(watcherId, onlineStatus) || "")}</span>`
+      ? `${memberCell(watcherId, watcherName || `ID ${watcherId}`, onlineStatus)} <span class="tocw-muted tocw-slot__status">${escapeHtml(statusText(statusInfo(watcherId, onlineStatus)))}</span>`
       : locked
         ? `<span class="tocw-muted">Locked</span>`
         : `<span class="tocw-muted">Open</span>`;
@@ -3915,11 +4056,13 @@
     if (chain?.active) lines.push(`LIVE: ${chain.current} hits · ${duration(chainRemaining())} to drop`);
     else if (event) lines.push(`Next: ${event.title} — ${tctTime(event.starts_at, true)}`);
     else lines.push("No chain scheduled");
+    // Pasted into faction chat, so it must not accuse anyone of being away on a reading
+    // we can't stand behind — statusText says "Unknown" rather than repeating a stale one.
     lines.push(current?.watcher_id
-      ? `On watch: ${rosterName(current.watcher_id, current.watcher_name || `ID ${current.watcher_id}`)} (${rosterStatus(current.watcher_id, current.watcher_online_status) || "Unknown"})`
+      ? `On watch: ${rosterName(current.watcher_id, current.watcher_name || `ID ${current.watcher_id}`)} (${statusText(statusInfo(current.watcher_id, current.watcher_online_status))})`
       : "On watch: nobody ⚠️");
     lines.push(next?.watcher_id
-      ? `Next: ${rosterName(next.watcher_id, next.watcher_name || `ID ${next.watcher_id}`)} @ ${tctTime(next.shift_start)} (${rosterStatus(next.watcher_id, next.watcher_online_status) || "Unknown"})`
+      ? `Next: ${rosterName(next.watcher_id, next.watcher_name || `ID ${next.watcher_id}`)} @ ${tctTime(next.shift_start)} (${statusText(statusInfo(next.watcher_id, next.watcher_online_status))})`
       : "Next: unassigned ⚠️");
     if (h && h.state === "risk") lines.push(`🚨 Handoff: ${h.name} isn't online`);
     if (h && h.state === "gap") lines.push("🚨 Handoff: no watcher after the current shift");
@@ -4401,6 +4544,12 @@
         if (active) shiftEl.textContent = duration(Math.max(0, Math.floor((new Date(active.end).getTime() - Date.now()) / 1000)));
         else if (next) shiftEl.textContent = duration(countdownTo(next.start));
       }
+
+      // Everything else that measures time — "last attack … ago", the handoff countdown.
+      // Without this they only moved when a poll rebuilt the panel, so they advanced in
+      // 3-second jumps and looked stuck in between.
+      const box = document.getElementById("tocw");
+      if (box) tickRelativeTimes(box);
     } catch (error) {
       console.error("[Torn Overseer Chain Watch] tick failed", error);
     }
@@ -4443,7 +4592,12 @@
         openSlotAction,
         parseRoster,
         rosterName,
-        rosterStatus,
+        statusInfo,
+        statusIsOffline,
+        statusClass,
+        statusText,
+        secondsSinceTorn,
+        tickRelativeTimes,
         profileLink,
         absentMembers,
         normalizedShifts,
